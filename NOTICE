@@ -1,0 +1,14 @@
+Milvus Plugin for Grok Bot & Cursor
+Copyright 2026 yin min and contributors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This plugin does not vendor any third-party source code. At runtime it downloads
+and launches the MCP server from:
+
+  zilliztech/mcp-server-milvus  https://github.com/zilliztech/mcp-server-milvus
+  Copyright Zilliz. Licensed under the Apache License, Version 2.0.
+
+Milvus is a project of the LF AI & Data Foundation. "Milvus" and "Zilliz" are
+trademarks of their respective owners; this is a community plugin and is not an
+official Zilliz product unless stated otherwise.

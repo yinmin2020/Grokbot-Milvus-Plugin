@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.db
+*.db.lock
+.env
+.DS_Store
+samples/kb/*.docx
+samples/kb/*.pdf
+*.log
+*.zip
+.pytest_cache/

@@ -1,0 +1,9 @@
+Hybrid Search in Milvus
+
+Hybrid search combines several vector searches in one request. A typical setup pairs a dense embedding field (semantic similarity) with a sparse BM25 field (keyword matching). Each AnnSearchRequest is executed separately and the results are fused by a reranker.
+
+Milvus provides two rerankers. RRFRanker uses Reciprocal Rank Fusion with a smoothing constant k, which defaults to 60; it only looks at ranks, so the score scales of the dense and sparse searches do not matter. WeightedRanker combines normalized scores with user-defined weights, for example 0.7 for dense and 0.3 for sparse.
+
+Full-text search with BM25 requires a VARCHAR field with enable_analyzer set to true, a SPARSE_FLOAT_VECTOR output field, and a BM25 function that maps the text field to the sparse field. The raw query text is passed directly as search data; Milvus tokenizes it with the same analyzer. For Chinese text, use the jieba tokenizer or the built-in chinese analyzer.
+
+Hybrid search usually improves recall for queries that contain rare identifiers such as product codes, error codes or function names, which dense embeddings tend to blur.

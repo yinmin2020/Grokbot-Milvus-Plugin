@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Milvus plugin">
+  <rect width="128" height="128" rx="28" fill="#0B1F3A"/>
+  <g fill="none" stroke="#00B3FF" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M28 92 L46 36 L64 74 L82 36 L100 92"/>
+  </g>
+  <g fill="#7FE1FF">
+    <circle cx="28" cy="92" r="8"/><circle cx="46" cy="36" r="8"/><circle cx="64" cy="74" r="8"/>
+    <circle cx="82" cy="36" r="8"/><circle cx="100" cy="92" r="8"/>
+  </g>
+</svg>

@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "milvus": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/zilliztech/mcp-server-milvus@6a2bff91fa629c0e62581be46ae7abba78f3a2c1",
+        "--with",
+        "mcp<2",
+        "--with",
+        "milvus-lite; sys_platform != 'win32'",
+        "mcp-server-milvus",
+        "--milvus-uri",
+        "${MILVUS_URI}"
+      ],
+      "env": {
+        "MILVUS_TOKEN": "${MILVUS_TOKEN}",
+        "MILVUS_DB": "${MILVUS_DB}"
+      }
+    }
+  }
+}
