@@ -1,57 +1,34 @@
 ---
 name: milvus-ops-maintenance
-description: Milvus 安全运维变更：建索引、删索引、加载和释放（load/release）、分区创建和删除、flush、compaction、按条件删除数据、删除 Collection，以及备份建议。所有写操作默认只演练（dry-run），危险操作必须加 --execute 和 --confirm <collection 名>，受保护的 Collection 会被直接拒绝。当用户要修改索引、释放内存、清理数据、压缩、备份时使用。
+description: Plan and execute guarded Milvus index, partition, load, delete and compaction operations.
 ---
 
-# Milvus 安全运维变更
+# milvus-ops-maintenance
 
-脚本：`scripts/milvus_ops.py`。上游 MCP Server 没有这些工具（upsert、drop/create index、分区、compaction、flush、drop collection 等），所以统一用这个脚本处理。
+## Execution and configuration
 
-## 三级安全机制
-
-| 级别 | 命令 | 执行条件 |
-| --- | --- | --- |
-| 写（可恢复） | `index-create`、`load`、`partition-create`、`flush`、`compact` | 默认 dry-run；加 `--execute` 才真正执行 |
-| 危险（不可恢复，或会影响线上检索） | `release`、`index-drop`、`partition-drop`、`delete-entities`、`drop-collection` | 默认 dry-run；必须同时加 `--execute` 和 `--confirm <完全一致的 collection 名>` |
-| 受保护 | 环境变量 `OPS_PROTECTED_COLLECTIONS`（逗号分隔） | 所有写操作和危险操作都直接拒绝 |
-
-- 设置 `OPS_WRITE_ALLOW_PREFIX=test_,tmp_` 后，只允许修改带这些前缀的 Collection（适合测试环境和共享集群）。
-- 每次真正执行的写操作都会追加到 `OPS_AUDIT_LOG`（默认 `~/.milvus-ops-audit.log`）。日志里不含密钥。
-
-## 标准流程（Agent 必须遵守）
-
-1. 只读检查：运行 `describe <col>` 和 `collections`，向用户说明现状。
-2. 不加 `--execute` 运行一次，把 dry-run 输出（影响范围、匹配行数）原样告诉用户。
-3. 危险操作要等用户**明确说出 Collection 名并同意**，然后才加 `--execute --confirm <col>`。
-4. 执行完再运行一次 `describe` 或 `collections`，确认结果。
-
-## 常用命令
+Resolve `PLUGIN_ROOT` to the plugin directory containing `pyproject.toml`, two levels above this SKILL.md. Use an absolute path. The user's current directory may be a different project. Run scripts as:
 
 ```bash
-# 建索引（标量 INVERTED / 向量 HNSW）
-uv run scripts/milvus_ops.py index-create kb_docs --field tag --index-type INVERTED --execute
-uv run scripts/milvus_ops.py index-create kb_docs --field dense --index-type HNSW --metric COSINE --params '{"M":16,"efConstruction":200}' --execute
-# 换索引：release → index-drop → index-create → load
-uv run scripts/milvus_ops.py release kb_docs --execute --confirm kb_docs
-uv run scripts/milvus_ops.py index-drop kb_docs --index dense --execute --confirm kb_docs
-uv run scripts/milvus_ops.py load kb_docs --execute
-# 分区
-uv run scripts/milvus_ops.py partition-create kb_docs p2026 --execute
-uv run scripts/milvus_ops.py partition-drop kb_docs p2026 --execute --confirm kb_docs
-# 刷盘和压缩（删除大量数据后回收空间）
-uv run scripts/milvus_ops.py flush kb_docs --execute
-uv run scripts/milvus_ops.py compact kb_docs --execute --wait
-# 按条件删除（dry-run 会显示匹配行数；空条件会被拒绝）
-uv run scripts/milvus_ops.py delete-entities kb_docs --filter 'source like "old/%"'
-# 删除 Collection（先备份）
-uv run scripts/milvus_ops.py drop-collection tmp_x --execute --confirm tmp_x
+uv run --project "$PLUGIN_ROOT" "$PLUGIN_ROOT/scripts/SCRIPT.py" --help
 ```
 
-## 备份建议
+Replace SCRIPT with the entry point below. Connection settings are process environment variables: `MILVUS_URI` (default `./milvus.db`), `MILVUS_TOKEN`, and `MILVUS_DB` (default `default`). Use an absolute Lite path for repeatable connections from different working directories. The database lives on the machine executing the script. Every script closes its client before exiting; serialize commands sharing a Lite path.
 
-运行 `uv run scripts/milvus_ops.py backup-guide` 可以查看完整建议（只是建议，不会执行任何操作）。要点：
+Respect `OPS_PROTECTED_COLLECTIONS` and `OPS_WRITE_ALLOW_PREFIX` for every write. Confirm the user's intended collection and action before destructive changes; existing explicit authorization is sufficient. Do not print tokens or embed them in commands. Inspect `--help` for argument details. Do not invent commands or fall back to generated database code.
 
-- 推荐使用官方的 [milvus-backup](https://github.com/zilliztech/milvus-backup) 工具：先 `check`，再 `create -n bk_日期 [-c col]`，恢复时用 `restore -s _restored` 恢复到带后缀的新 Collection，核对行数后再切换别名。
-- 备份前先执行 `flush`。
-- 知识库类的 Collection 也可以从源文档重新导入来恢复（源文件放在 git 或对象存储里）。
-- 任何 drop 操作之前，都要先确认备份可以成功恢复。
+## Guarded maintenance
+
+Use `milvus_ops.py`. Every mutation defaults to a dry run. Index creation, load, partition creation, explicit flush and compaction need `--execute`. Release, index/partition deletion, entity deletion and collection deletion also need `--confirm COLLECTION`. The shared protected collection list and write prefix rules apply. Executed maintenance is appended to `OPS_AUDIT_LOG` (default `~/.milvus-ops-audit.log`); a failed log write emits a warning.
+
+```bash
+uv run --project "$PLUGIN_ROOT" "$PLUGIN_ROOT/scripts/milvus_ops.py" load team_docs
+uv run --project "$PLUGIN_ROOT" "$PLUGIN_ROOT/scripts/milvus_ops.py" load team_docs --execute
+uv run --project "$PLUGIN_ROOT" "$PLUGIN_ROOT/scripts/milvus_ops.py" index-create articles --field dense --index-type AUTOINDEX --metric COSINE
+uv run --project "$PLUGIN_ROOT" "$PLUGIN_ROOT/scripts/milvus_ops.py" partition-create articles archive
+uv run --project "$PLUGIN_ROOT" "$PLUGIN_ROOT/scripts/milvus_ops.py" delete-entities articles --filter 'pk == "obsolete"'
+uv run --project "$PLUGIN_ROOT" "$PLUGIN_ROOT/scripts/milvus_ops.py" compact articles
+uv run --project "$PLUGIN_ROOT" "$PLUGIN_ROOT/scripts/milvus_ops.py" drop-collection obsolete_docs
+```
+
+Inspect affected resources and show the dry-run plan before executing a destructive operation. Do not drop/recreate incompatible knowledge-base schemas without the user's authorization; prefer a new collection. Use `backup-guide` for guidance only; the script does not create or restore backups. Maintenance capabilities depend on the deployment. Do not automatically flush after ordinary writes, and do not convert a backend error into success.

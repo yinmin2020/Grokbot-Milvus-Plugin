@@ -1,0 +1,29 @@
+[project]
+name = "milvus-plugin"
+version = "0.2.0"
+description = "Milvus document, memory, data and operations scripts"
+requires-python = ">=3.10"
+dependencies = [
+    "pymilvus>=3.0.2,<4",
+    "milvus-lite>=3.2.2,<4; sys_platform != 'win32'",
+    "jieba>=0.42.1",
+    "pypdf>=4",
+    "python-docx>=1.1",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.9", "fpdf2>=2.7"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["scripts"]
+markers = ["e2e: requires a real embedding endpoint"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

@@ -1,8 +1,4 @@
-# /// script
-# requires-python = ">=3.10"
-# dependencies = ["pymilvus>=2.6,<4"]
-# ///
-"""Milvus ops toolkit (运维助手): safe, scriptable Milvus operations.
+"""Milvus ops toolkit (operations assistant): safe, scriptable Milvus operations.
 
 READ (always safe):
   health | collections | describe COL | partitions COL | segments COL | compaction-state JOB_ID
@@ -21,10 +17,18 @@ Guards:
   * every executed write is appended to OPS_AUDIT_LOG (default ~/.milvus-ops-audit.log), no secrets.
 Connection: MILVUS_URI / MILVUS_TOKEN / MILVUS_DB; metrics: MILVUS_METRICS_URL (default http://<host>:9091/metrics).
 """
-import argparse, json, os, re, sys, time, urllib.parse, urllib.request
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.parse
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mvbot_common import add_milvus_args, connect, env, print_json, redact_uri, urlopen
+from mvbot_common import add_milvus_args, check_write, connect, env, print_json, redact_uri, urlopen
 
 WRITE = {"index-create", "load", "partition-create", "flush", "compact"}
 DESTRUCTIVE = {"release", "index-drop", "partition-drop", "delete-entities", "drop-collection"}
@@ -39,20 +43,27 @@ def audit(a, action, detail):
     path = os.path.expanduser(env("OPS_AUDIT_LOG", "~/.milvus-ops-audit.log"))
     try:
         with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "uri": redact_uri(a.uri), "db": a.db,
-                                "action": action, **detail}, ensure_ascii=False) + "\n")
-    except OSError:
-        pass
+            f.write(
+                json.dumps(
+                    {
+                        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "uri": redact_uri(a.uri),
+                        "db": a.db,
+                        "action": action,
+                        **detail,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except OSError as exc:
+        print(f"WARNING: audit log could not be written: {exc}", file=sys.stderr)
 
 
 def guard(c, a, plan):
     """Return True if the action should execute; print the plan otherwise."""
     col = a.collection
-    if col in protected_set():
-        sys.exit(f"REFUSED: '{col}' is a protected collection; {a.cmd} is not allowed on it.")
-    allow = [x.strip() for x in env("OPS_WRITE_ALLOW_PREFIX", "").split(",") if x.strip()]
-    if allow and not any(col.startswith(p) for p in allow):
-        sys.exit(f"REFUSED: OPS_WRITE_ALLOW_PREFIX={','.join(allow)} does not allow writes to '{col}'.")
+    check_write(col)
     if not c.has_collection(col):
         sys.exit(f"ERROR: collection '{col}' does not exist")
     destructive = a.cmd in DESTRUCTIVE
@@ -99,10 +110,17 @@ def http_get(url, timeout=5):
 
 def cmd_health(c, a):
     import pymilvus
+
     t0 = time.time()
     info = c.get_server_version(detail=True)
     rtt = round((time.time() - t0) * 1000, 1)
-    out = {"uri": redact_uri(a.uri), "db": a.db, "server": info, "pymilvus": pymilvus.__version__, "rpc_ms": rtt}
+    out = {
+        "uri": redact_uri(a.uri),
+        "db": a.db,
+        "server": info,
+        "pymilvus": pymilvus.__version__,
+        "rpc_ms": rtt,
+    }
     try:
         out["server_type"] = c.get_server_type()
     except Exception as e:
@@ -114,7 +132,11 @@ def cmd_health(c, a):
         st, body = http_get(url)
         out["healthz"] = {"url": url, "status": st, "body": body.strip()[:100]}
     except Exception as e:
-        out["healthz"] = {"url": url, "error": str(e)[:120], "hint": "set MILVUS_METRICS_URL if the HTTP port is not 9091"}
+        out["healthz"] = {
+            "url": url,
+            "error": str(e)[:120],
+            "hint": "set MILVUS_METRICS_URL if the HTTP port is not 9091",
+        }
     print_json(out)
 
 
@@ -124,9 +146,24 @@ def index_summary(c, col):
         try:
             d = c.describe_index(col, name)
         except Exception as e:
-            out.append({"index_name": name, "error": str(e)[:80]}); continue
-        out.append({k: d.get(k) for k in ("index_name", "field_name", "index_type", "metric_type", "state",
-                                           "indexed_rows", "total_rows", "pending_index_rows") if k in d})
+            out.append({"index_name": name, "error": str(e)[:80]})
+            continue
+        out.append(
+            {
+                k: d.get(k)
+                for k in (
+                    "index_name",
+                    "field_name",
+                    "index_type",
+                    "metric_type",
+                    "state",
+                    "indexed_rows",
+                    "total_rows",
+                    "pending_index_rows",
+                )
+                if k in d
+            }
+        )
     return out
 
 
@@ -138,22 +175,29 @@ def cmd_collections(c, a):
             r["row_count"] = row_count(c, col)
             r["load_state"] = load_state(c, col)
             idx = index_summary(c, col)
-            r["indexes"] = [f"{i.get('field_name')}:{i.get('index_type')}/{i.get('metric_type') or '-'}" for i in idx]
+            r["indexes"] = [
+                f"{i.get('field_name')}:{i.get('index_type')}/{i.get('metric_type') or '-'}" for i in idx
+            ]
             r["protected"] = col in protected_set()
         except Exception as e:
             r["error"] = str(e)[:120]
         rows.append(r)
     if a.json:
-        print_json(rows); return
+        print_json(rows)
+        return
     for r in rows:
         flag = " [protected]" if r.get("protected") else ""
-        print(f"{r['collection']}{flag}: rows={r.get('row_count')} load={r.get('load_state')} "
-              f"indexes={', '.join(r.get('indexes', [])) or '-'}" + (f" error={r['error']}" if "error" in r else ""))
+        print(
+            f"{r['collection']}{flag}: rows={r.get('row_count')} load={r.get('load_state')} "
+            f"indexes={', '.join(r.get('indexes', [])) or '-'}"
+            + (f" error={r['error']}" if "error" in r else "")
+        )
     print(f"total: {len(rows)} collections")
 
 
 def dtype_name(t):
     from pymilvus import DataType
+
     try:
         return DataType(int(t)).name if not isinstance(t, DataType) else t.name
     except (ValueError, TypeError):
@@ -170,15 +214,32 @@ def cmd_describe(c, a):
             if f.get(k):
                 x[k] = f[k]
         fields.append(x)
-    print_json({"collection": a.collection, "description": d.get("description"), "fields": fields,
-                "functions": [{"name": f.get("name"), "type": str(f.get("type")), "input": f.get("input_field_names"),
-                               "output": f.get("output_field_names"), "params": f.get("params")} for f in d.get("functions", [])],
-                "enable_dynamic_field": d.get("enable_dynamic_field"), "num_shards": d.get("num_shards"),
-                "consistency_level": d.get("consistency_level"), "properties": d.get("properties"),
-                "partitions": c.list_partitions(a.collection), "indexes": index_summary(c, a.collection),
-                "load_state": load_state(c, a.collection),
-                "row_count": row_count(c, a.collection),
-                "aliases": c.list_aliases(a.collection).get("aliases")})
+    print_json(
+        {
+            "collection": a.collection,
+            "description": d.get("description"),
+            "fields": fields,
+            "functions": [
+                {
+                    "name": f.get("name"),
+                    "type": str(f.get("type")),
+                    "input": f.get("input_field_names"),
+                    "output": f.get("output_field_names"),
+                    "params": f.get("params"),
+                }
+                for f in d.get("functions", [])
+            ],
+            "enable_dynamic_field": d.get("enable_dynamic_field"),
+            "num_shards": d.get("num_shards"),
+            "consistency_level": d.get("consistency_level"),
+            "properties": d.get("properties"),
+            "partitions": c.list_partitions(a.collection),
+            "indexes": index_summary(c, a.collection),
+            "load_state": load_state(c, a.collection),
+            "row_count": row_count(c, a.collection),
+            "aliases": c.list_aliases(a.collection).get("aliases"),
+        }
+    )
 
 
 def cmd_partitions(c, a):
@@ -194,8 +255,19 @@ def cmd_partitions(c, a):
 
 def _seg(s):
     d = {}
-    for k in ("segment_id", "collection_id", "partition_id", "num_rows", "state", "level", "is_sorted",
-              "mem_size", "index_name", "node_ids", "storage_version"):
+    for k in (
+        "segment_id",
+        "collection_id",
+        "partition_id",
+        "num_rows",
+        "state",
+        "level",
+        "is_sorted",
+        "mem_size",
+        "index_name",
+        "node_ids",
+        "storage_version",
+    ):
         v = getattr(s, k, None)
         if v is not None:
             d[k] = str(v) if k in ("state", "level") else v
@@ -208,9 +280,15 @@ def cmd_segments(c, a):
         loaded = [_seg(s) for s in c.list_loaded_segments(a.collection)]
     except Exception as e:
         loaded = f"n/a ({str(e)[:80]})"
-    print_json({"collection": a.collection, "persistent_count": len(pers),
-                "persistent_rows": sum(s.get("num_rows", 0) for s in pers), "persistent": pers,
-                "loaded": loaded})
+    print_json(
+        {
+            "collection": a.collection,
+            "persistent_count": len(pers),
+            "persistent_rows": sum(s.get("num_rows", 0) for s in pers),
+            "persistent": pers,
+            "loaded": loaded,
+        }
+    )
 
 
 def cmd_compaction_state(c, a):
@@ -219,20 +297,30 @@ def cmd_compaction_state(c, a):
 
 CURATED = [  # (metric, group-by label or None, kind)
     ("milvus_num_node", "role_name", "sum"),
-    ("milvus_rootcoord_collection_num", None, "sum"), ("milvus_rootcoord_partition_num", None, "sum"),
-    ("milvus_rootcoord_entity_num", None, "sum"), ("milvus_rootcoord_credential_num", None, "sum"),
-    ("milvus_rootcoord_num_of_roles", None, "sum"), ("milvus_rootcoord_force_deny_writing_counter", None, "sum"),
-    ("milvus_querynode_collection_num", None, "sum"), ("milvus_querynode_entity_num", None, "sum"),
-    ("milvus_querynode_segment_num", "segment_state", "sum"), ("milvus_querynode_disk_used_size", None, "sum"),
-    ("milvus_datacoord_segment_num", "segment_state", "sum"), ("milvus_datacoord_stored_rows_num", None, "sum"),
-    ("milvus_datacoord_stored_binlog_size", None, "sum"), ("milvus_datacoord_stored_index_files_size", None, "sum"),
+    ("milvus_rootcoord_collection_num", None, "sum"),
+    ("milvus_rootcoord_partition_num", None, "sum"),
+    ("milvus_rootcoord_entity_num", None, "sum"),
+    ("milvus_rootcoord_credential_num", None, "sum"),
+    ("milvus_rootcoord_num_of_roles", None, "sum"),
+    ("milvus_rootcoord_force_deny_writing_counter", None, "sum"),
+    ("milvus_querynode_collection_num", None, "sum"),
+    ("milvus_querynode_entity_num", None, "sum"),
+    ("milvus_querynode_segment_num", "segment_state", "sum"),
+    ("milvus_querynode_disk_used_size", None, "sum"),
+    ("milvus_datacoord_segment_num", "segment_state", "sum"),
+    ("milvus_datacoord_stored_rows_num", None, "sum"),
+    ("milvus_datacoord_stored_binlog_size", None, "sum"),
+    ("milvus_datacoord_stored_index_files_size", None, "sum"),
     ("milvus_datacoord_compaction_task_num", "compaction_task_state", "sum"),
     ("milvus_proxy_req", "status", "sum"),
-    ("milvus_proxy_sq_latency", "query_type", "avg"), ("milvus_proxy_mutation_latency", "msg_type", "avg"),
-    ("process_resident_memory_bytes", None, "sum"), ("process_cpu_seconds_total", None, "sum"),
-    ("milvus_jemalloc_resident_bytes", None, "sum"), ("go_goroutines", None, "sum"),
+    ("milvus_proxy_sq_latency", "query_type", "avg"),
+    ("milvus_proxy_mutation_latency", "msg_type", "avg"),
+    ("process_resident_memory_bytes", None, "sum"),
+    ("process_cpu_seconds_total", None, "sum"),
+    ("milvus_jemalloc_resident_bytes", None, "sum"),
+    ("go_goroutines", None, "sum"),
 ]
-LINE = re.compile(r'^([a-zA-Z_:][\w:]*)(\{(.*)\})?\s+(\S+)')
+LINE = re.compile(r"^([a-zA-Z_:][\w:]*)(\{(.*)\})?\s+(\S+)")
 LABEL = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
 
 
@@ -250,7 +338,9 @@ def cmd_metrics(c, a):
     try:
         st, text = http_get(url, timeout=10)
     except Exception as e:
-        sys.exit(f"metrics endpoint not reachable at {url}: {str(e)[:120]} (set MILVUS_METRICS_URL / --metrics-url)")
+        sys.exit(
+            f"metrics endpoint not reachable at {url}: {str(e)[:120]} (set MILVUS_METRICS_URL / --metrics-url)"
+        )
     samples = []
     for line in text.splitlines():
         if line.startswith("#"):
@@ -263,34 +353,43 @@ def cmd_metrics(c, a):
                 pass
     if a.grep:
         rx = re.compile(a.grep)
-        for n, l, v in samples:
+        for n, labels, v in samples:
             if rx.search(n):
-                print(n, json.dumps(l, ensure_ascii=False), v)
+                print(n, json.dumps(labels, ensure_ascii=False), v)
         return
-    out = {"url": url, "families": len({re.sub(r"_(bucket|sum|count|total)$", "", n) for n, _, _ in samples}),
-           "samples": len(samples)}
-    bi = next((l for n, l, _ in samples if n == "milvus_build_info"), None)
+    out = {
+        "url": url,
+        "families": len({re.sub(r"_(bucket|sum|count|total)$", "", n) for n, _, _ in samples}),
+        "samples": len(samples),
+    }
+    bi = next((labels for n, labels, _ in samples if n == "milvus_build_info"), None)
     if bi:
         out["build_info"] = bi
     for name, by, kind in CURATED:
         if kind == "avg":
             s, cnt = {}, {}
-            for n, l, v in samples:
-                key = l.get(by, "all") if by else "all"
+            for n, labels, v in samples:
+                key = labels.get(by, "all") if by else "all"
                 if n == name + "_sum":
                     s[key] = s.get(key, 0) + v
                 elif n == name + "_count":
                     cnt[key] = cnt.get(key, 0) + v
             if cnt:
-                out[name + " (avg ms, count)"] = {k: (round(s.get(k, 0) / cnt[k], 2) if cnt[k] else None, int(cnt[k])) for k in cnt}
+                out[name + " (avg ms, count)"] = {
+                    k: (round(s.get(k, 0) / cnt[k], 2) if cnt[k] else None, int(cnt[k])) for k in cnt
+                }
             continue
         vals = {}
-        for n, l, v in samples:
+        for n, labels, v in samples:
             if n == name:
-                key = l.get(by, "all") if by else "all"
+                key = labels.get(by, "all") if by else "all"
                 vals[key] = vals.get(key, 0) + v
         if vals:
-            out[name] = human(name, vals["all"]) if list(vals) == ["all"] else {k: human(name, v) for k, v in vals.items()}
+            out[name] = (
+                human(name, vals["all"])
+                if list(vals) == ["all"]
+                else {k: human(name, v) for k, v in vals.items()}
+            )
     print_json(out)
 
 
@@ -312,7 +411,15 @@ def cmd_users(c, a):
         for r in c.list_roles():
             try:
                 privs = c.describe_role(r).get("privileges", [])
-                out["roles"].append({"role": r, "privileges": [f"{p.get('object_type')}:{p.get('object_name')}:{p.get('privilege')}" for p in privs][:50]})
+                out["roles"].append(
+                    {
+                        "role": r,
+                        "privileges": [
+                            f"{p.get('object_type')}:{p.get('object_name')}:{p.get('privilege')}"
+                            for p in privs
+                        ][:50],
+                    }
+                )
             except Exception:
                 out["roles"].append({"role": r})
     except Exception as e:
@@ -343,9 +450,15 @@ def cmd_backup_guide(c, a):
 def cmd_index_create(c, a):
     params = json.loads(a.params) if a.params else {}
     plan = f"create index on {a.collection}.{a.field} type={a.index_type} metric={a.metric or '-'} params={params}"
-    existing = [i for i in index_summary(c, a.collection) if i.get("field_name") == a.field] if c.has_collection(a.collection) else []
+    existing = (
+        [i for i in index_summary(c, a.collection) if i.get("field_name") == a.field]
+        if c.has_collection(a.collection)
+        else []
+    )
     if existing:
-        sys.exit(f"ERROR: field '{a.field}' already has index {existing[0].get('index_name')}; drop it first (index-drop).")
+        sys.exit(
+            f"ERROR: field '{a.field}' already has index {existing[0].get('index_name')}; drop it first (index-drop)."
+        )
     if not guard(c, a, plan):
         return
     ip = c.prepare_index_params()
@@ -382,7 +495,11 @@ def cmd_load(c, a):
 
 
 def cmd_release(c, a):
-    plan = f"release {a.collection}" + (f" partitions={a.partitions}" if a.partitions else "") + " (searches will fail until loaded again)"
+    plan = (
+        f"release {a.collection}"
+        + (f" partitions={a.partitions}" if a.partitions else "")
+        + " (searches will fail until loaded again)"
+    )
     if not guard(c, a, plan):
         return
     if a.partitions:
@@ -433,7 +550,8 @@ def cmd_compact(c, a):
     if a.wait:
         t0 = time.time()
         while "Completed" not in state and time.time() - t0 < a.wait_timeout:
-            time.sleep(2); state = str(c.get_compaction_state(job))
+            time.sleep(2)
+            state = str(c.get_compaction_state(job))
     done(a, plan, job_id=job, state=state)
 
 
@@ -464,7 +582,7 @@ def cmd_drop_collection(c, a):
 
 
 # ------------------------------------------------------------------ CLI
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -481,29 +599,58 @@ def main():
 
     p("health", col=False)
     p("collections", col=False).add_argument("--json", action="store_true")
-    p("describe"); p("partitions"); p("segments")
-    x = p("compaction-state", col=False); x.add_argument("job_id", type=int)
-    x = p("metrics", col=False); x.add_argument("--grep", help="print raw samples whose name matches REGEX")
-    p("users", col=False); p("backup-guide", col=False)
+    p("describe")
+    p("partitions")
+    p("segments")
+    x = p("compaction-state", col=False)
+    x.add_argument("job_id", type=int)
+    x = p("metrics", col=False)
+    x.add_argument("--grep", help="print raw samples whose name matches REGEX")
+    p("users", col=False)
+    p("backup-guide", col=False)
     x = p("index-create", write=True)
-    x.add_argument("--field", required=True); x.add_argument("--index-type", default="AUTOINDEX")
-    x.add_argument("--metric"); x.add_argument("--params", help='JSON, e.g. {"M":16,"efConstruction":200}')
+    x.add_argument("--field", required=True)
+    x.add_argument("--index-type", default="AUTOINDEX")
+    x.add_argument("--metric")
+    x.add_argument("--params", help='JSON, e.g. {"M":16,"efConstruction":200}')
     x.add_argument("--index-name")
-    x = p("index-drop", write=True); x.add_argument("--index", required=True)
-    x = p("load", write=True); x.add_argument("--partitions", nargs="*")
-    x = p("release", write=True); x.add_argument("--partitions", nargs="*")
-    x = p("partition-create", write=True); x.add_argument("partition")
-    x = p("partition-drop", write=True); x.add_argument("partition")
+    x = p("index-drop", write=True)
+    x.add_argument("--index", required=True)
+    x = p("load", write=True)
+    x.add_argument("--partitions", nargs="*")
+    x = p("release", write=True)
+    x.add_argument("--partitions", nargs="*")
+    x = p("partition-create", write=True)
+    x.add_argument("partition")
+    x = p("partition-drop", write=True)
+    x.add_argument("partition")
     p("flush", write=True)
-    x = p("compact", write=True); x.add_argument("--clustering", action="store_true")
-    x.add_argument("--wait", action="store_true"); x.add_argument("--wait-timeout", type=int, default=120)
-    x = p("delete-entities", write=True); x.add_argument("--filter", required=True)
+    x = p("compact", write=True)
+    x.add_argument("--clustering", action="store_true")
+    x.add_argument("--wait", action="store_true")
+    x.add_argument("--wait-timeout", type=int, default=120)
+    x = p("delete-entities", write=True)
+    x.add_argument("--filter", required=True)
     p("drop-collection", write=True)
-    a = ap.parse_args()
+    return ap
+
+
+def main():
+    a = build_parser().parse_args()
+    if a.cmd == "backup-guide":
+        cmd_backup_guide(None, a)
+        return
     c = connect(a)
-    if getattr(a, "collection", None) and a.cmd not in WRITE | DESTRUCTIVE and not c.has_collection(a.collection):
-        sys.exit(f"ERROR: collection '{a.collection}' does not exist")
-    globals()["cmd_" + a.cmd.replace("-", "_")](c, a)
+    try:
+        if (
+            getattr(a, "collection", None)
+            and a.cmd not in WRITE | DESTRUCTIVE
+            and not c.has_collection(a.collection)
+        ):
+            sys.exit(f"ERROR: collection '{a.collection}' does not exist")
+        globals()["cmd_" + a.cmd.replace("-", "_")](c, a)
+    finally:
+        c.close()
 
 
 if __name__ == "__main__":

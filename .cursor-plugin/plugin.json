@@ -2,7 +2,7 @@
   "name": "milvus",
   "displayName": "Milvus",
   "version": "0.2.0",
-  "description": "Use the Milvus vector database (self-hosted Milvus, Zilliz Cloud, or Milvus Lite) from the agent: manage collections, insert data, run vector, full-text (BM25) and hybrid search, build RAG knowledge bases and agent memory. Wraps zilliztech/mcp-server-milvus and adds task skills plus two script toolkits: a knowledge-base toolkit (document ingest with Ollama/OpenAI-compatible embeddings, hybrid search, cited answers) and a guarded ops toolkit (health, metrics, indexes, partitions, compaction; dry-run by default).",
+  "description": "Milvus skills backed by Python scripts using MilvusClient: collection and data operations, dense/BM25/hybrid retrieval, document knowledge bases, explicit user-scoped memory, and guarded maintenance. Supports Milvus Lite, Milvus server and Zilliz Cloud.",
   "author": {
     "name": "yin min"
   },
@@ -18,36 +18,9 @@
     "bm25",
     "rag",
     "agent-memory",
-    "mcp",
     "ollama",
     "knowledge-base",
     "ops"
   ],
-  "logo": "assets/logo.svg",
-  "variables": {
-    "type": "object",
-    "properties": {
-      "MILVUS_URI": {
-        "type": "string",
-        "title": "Milvus URI",
-        "description": "Milvus endpoint. Standalone/cluster: http://localhost:19530. Zilliz Cloud: your cluster's public endpoint (https://...zillizcloud.com). Milvus Lite (macOS/Linux only): an absolute path to a local .db file, e.g. /path/to/milvus_demo.db.",
-        "default": "http://localhost:19530"
-      },
-      "MILVUS_TOKEN": {
-        "type": "string",
-        "title": "Milvus token (secret)",
-        "description": "Optional. Zilliz Cloud API key, or 'username:password' for a Milvus instance with authentication enabled (e.g. root:Milvus). Leave empty for local Milvus without auth or Milvus Lite.",
-        "default": ""
-      },
-      "MILVUS_DB": {
-        "type": "string",
-        "title": "Database name",
-        "description": "Optional. Milvus database to use. Defaults to 'default'.",
-        "default": "default"
-      }
-    },
-    "required": [
-      "MILVUS_URI"
-    ]
-  }
+  "logo": "assets/logo.svg"
 }

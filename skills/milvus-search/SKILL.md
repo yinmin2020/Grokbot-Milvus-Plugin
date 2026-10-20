@@ -1,51 +1,32 @@
 ---
 name: milvus-search
-description: Run vector similarity, full-text (BM25), hybrid (dense + BM25 sparse) and filtered scalar searches in Milvus through the Milvus MCP server. Use when the user wants to search, retrieve similar items, do keyword or hybrid retrieval, or query records by metadata.
+description: Search Milvus with dense vectors, native BM25, hybrid fusion, and server-side metadata filters.
 ---
 
-# Searching Milvus: vector, BM25, hybrid, filters
+# milvus-search
 
-## Tools used
+## Execution and configuration
 
-| Tool | Use for | Needs |
-| --- | --- | --- |
-| `milvus_query` | exact metadata lookups, no ranking | `filter_expr` |
-| `milvus_vector_search` | dense similarity (+ optional filter, range search) | a query vector |
-| `milvus_text_search` | BM25 full-text search | BM25 collection whose sparse field is named `sparse` |
-| `milvus_hybrid_search` | BM25 + dense, fused with RRF (k=60) | BM25 sparse field + dense field + query vector |
-| `milvus_text_similarity_search` | send raw text, Milvus embeds it | Milvus ≥ 2.6 with an embedding Function on the collection |
+Resolve `PLUGIN_ROOT` to the plugin directory containing `pyproject.toml`, two levels above this SKILL.md. Use an absolute path. The user's current directory may be a different project. Run scripts as:
 
-## Instructions
-
-1. `milvus_get_collection_info` first: find vector field names, the `functions` list (BM25 / embedding
-   function present?) and scalar fields usable in filters.
-2. If search says the collection is not loaded (state "released"), call `milvus_load_collection` and retry.
-   Collections are often released after a Milvus / Milvus Lite restart.
-3. **Getting a query vector**: the MCP server has no embedding tool. Use, in order of preference:
-   a. `milvus_text_similarity_search` if the collection has a server-side embedding function;
-   b. a vector produced by the user's embedding code with the **same model used at insert time**;
-   c. otherwise, `milvus_text_search` (BM25) if available, which needs no vector.
-   Never fabricate a vector.
-4. **Vector search**: `milvus_vector_search` with `collection_name`, `vector`, `vector_field` (default
-   `"vector"`), `limit`, `output_fields`, optional `filter_expr`, and `metric_type` matching the index.
-   Range search: set `radius` / `range_filter` (for COSINE, `radius` is the minimum similarity).
-5. **Full-text (BM25)**: `milvus_text_search` with `query_text`. Limitations of the upstream tool:
-   the sparse field name is hard-coded to `sparse`, and it has **no filter parameter**. On Milvus Lite set
-   `drop_ratio: 0` (Lite rejects other values); on standalone/Zilliz Cloud the default 0.2 is fine.
-6. **Hybrid (dense + BM25 sparse)**: `milvus_hybrid_search` with
-   `query_text`, `text_field` = **the sparse BM25 output field (e.g. `sparse`), not the VARCHAR text
-   field**, `vector`, `vector_field` (e.g. `dense`), `limit`, `output_fields`, optional `filter_expr`.
-   Ranking is RRF with k=60 and cannot be changed (no weighted ranker exposed). Scores are RRF scores
-   (~0.03), not similarities — do not threshold on them.
-   If the collection has no BM25 function, hybrid search is not possible through this server; say so and
-   point to the pymilvus snippet in the `milvus-collection-design` skill.
-7. Always pass `output_fields` (e.g. `["text", "source"]`) so results are readable, and cite primary keys
-   / sources when presenting results.
-
-## Example (tested on Milvus Lite)
-
-```json
-{"collection_name": "kb", "query_text": "vector database", "text_field": "sparse",
- "vector": [0.1, 0.2, 0.3, 0.4], "vector_field": "dense", "limit": 5,
- "output_fields": ["text"], "filter_expr": "tag == \"db\""}
+```bash
+uv run --project "$PLUGIN_ROOT" "$PLUGIN_ROOT/scripts/SCRIPT.py" --help
 ```
+
+Replace SCRIPT with the entry point below. Connection settings are process environment variables: `MILVUS_URI` (default `./milvus.db`), `MILVUS_TOKEN`, and `MILVUS_DB` (default `default`). Use an absolute Lite path for repeatable connections from different working directories. The database lives on the machine executing the script. Every script closes its client before exiting; serialize commands sharing a Lite path.
+
+Respect `OPS_PROTECTED_COLLECTIONS` and `OPS_WRITE_ALLOW_PREFIX` for every write. Confirm the user's intended collection and action before destructive changes; existing explicit authorization is sufficient. Do not print tokens or embed them in commands. Inspect `--help` for argument details. Do not invent commands or fall back to generated database code.
+
+## Workflow
+
+Inspect the collection schema, vector fields, and index metric with `milvus_ops.py describe COLLECTION`. Use `milvus_data.py query` for scalar queries and `milvus_data.py search` for retrieval. Pass filters to Milvus before top-k selection. Treat a raw `--filter` as an explicit expression, not as a template for concatenating unescaped input.
+
+```bash
+uv run --project "$PLUGIN_ROOT" "$PLUGIN_ROOT/scripts/milvus_data.py" search --collection articles --mode bm25 --text "BM25" --filter 'metadata["lang"] == "en"'
+uv run --project "$PLUGIN_ROOT" "$PLUGIN_ROOT/scripts/milvus_data.py" search --collection articles --mode hybrid --text "BM25" --vector-file /absolute/path/query-vector.json --ranker rrf
+uv run --project "$PLUGIN_ROOT" "$PLUGIN_ROOT/scripts/milvus_data.py" query --collection articles --filter 'pk == "article-1"'
+```
+
+The vector file contains one JSON array of numbers produced by the same model as the stored vectors. Use `--dense-field`, `--sparse-field`, `--metric`, and `--output-fields` for compatible existing collections with other field names. Weighted fusion is available with `--ranker weighted --weights 0.7,0.3`. BM25 needs no query embedding. Scores from COSINE, BM25 and fusion have different scales; do not compare them with a shared threshold. L2 is lower-is-better; COSINE/IP are higher-is-better on supported versions.
+
+For text questions over imported documents use `milvus_kb.py query`, which handles query embeddings and citations. For personal memory always use `milvus_memory.py recall` so the mandatory user scope cannot be omitted.

@@ -1,15 +1,24 @@
-"""Shared helpers for the knowledge-base and ops scripts (milvus_kb.py, milvus_ops.py).
+"""Connection, embedding, validation and write guards shared by all entry points.
 
 Configuration comes from CLI flags first, then environment variables:
-  MILVUS_URI (default http://localhost:19530), MILVUS_TOKEN, MILVUS_DB (default "default")
+  MILVUS_URI (default ./milvus.db), MILVUS_TOKEN, MILVUS_DB (default "default")
   EMBED_PROVIDER  ollama | openai            (default ollama)
   EMBED_ENDPOINT  Ollama: http://localhost:11434 ; OpenAI-compatible: https://api.openai.com/v1
   EMBED_MODEL     e.g. embeddinggemma-2:740m / text-embedding-3-small
   EMBED_API_KEY   only for the openai provider (falls back to OPENAI_API_KEY); never printed
   KB_COLLECTION   default knowledge-base collection (default kb_docs)
-  OPS_PROTECTED_COLLECTIONS  comma-separated collections the ops script must never change
+  OPS_PROTECTED_COLLECTIONS  comma-separated collections no entry point may change
 """
-import ipaddress, json, os, sys, time, urllib.parse, urllib.request, urllib.error
+
+import ipaddress
+import json
+import math
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 
 def _is_private(url):
@@ -39,20 +48,122 @@ def env(name, default=None):
 
 def add_milvus_args(ap):
     g = ap.add_argument_group("Milvus connection")
-    g.add_argument("--uri", default=env("MILVUS_URI", "http://localhost:19530"))
-    g.add_argument("--token", default=env("MILVUS_TOKEN", ""), help="user:password or API key (or env MILVUS_TOKEN)")
+    g.add_argument("--uri", default=env("MILVUS_URI", "./milvus.db"))
+    g.add_argument(
+        "--token", default=env("MILVUS_TOKEN", ""), help="user:password or API key (or env MILVUS_TOKEN)"
+    )
     g.add_argument("--db", default=env("MILVUS_DB", "default"))
+    g.add_argument("--timeout", type=float, default=30.0)
 
 
 def connect(a):
-    os.environ.pop("MILVUS_URI", None)  # pymilvus validates this env var at import time
-    from pymilvus import MilvusClient
-    kw = {"uri": a.uri}
+    # The SDK validates MILVUS_URI as a server URL at import time, even for Lite.
+    saved_uri = os.environ.pop("MILVUS_URI", None)
+    try:
+        from pymilvus import MilvusClient
+    finally:
+        if saved_uri is not None:
+            os.environ["MILVUS_URI"] = saved_uri
+    kw = {"uri": a.uri, "timeout": getattr(a, "timeout", 30.0)}
     if a.token:
         kw["token"] = a.token
     if a.db and a.db != "default":
         kw["db_name"] = a.db
     return MilvusClient(**kw)
+
+
+def check_write(collection):
+    protected = {x.strip() for x in env("OPS_PROTECTED_COLLECTIONS", "").split(",") if x.strip()}
+    if collection in protected:
+        sys.exit(f"REFUSED: '{collection}' is a protected collection")
+    allow = [x.strip() for x in env("OPS_WRITE_ALLOW_PREFIX", "").split(",") if x.strip()]
+    if allow and not any(collection.startswith(p) for p in allow):
+        sys.exit(f"REFUSED: OPS_WRITE_ALLOW_PREFIX does not allow writes to '{collection}'")
+
+
+def confirm_write(a, destructive=False):
+    check_write(a.collection)
+    if not a.execute:
+        print_json({"dry_run": True, "command": a.cmd, "collection": a.collection})
+        return False
+    if destructive and a.confirm != a.collection:
+        sys.exit(f"REFUSED: --confirm must equal '{a.collection}'")
+    return True
+
+
+def literal(value):
+    """Encode an untrusted string as one Milvus filter literal."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def checked_text(value, name, max_bytes):
+    if not isinstance(value, str) or not value.strip() or len(value.encode()) > max_bytes:
+        raise ValueError(f"{name} must be nonempty text of at most {max_bytes} UTF-8 bytes")
+    return value
+
+
+def validate_vectors(vectors, dim, count=None):
+    if count is not None and len(vectors) != count:
+        raise ValueError("Embedding count does not match input count")
+    for vector in vectors:
+        if (
+            not isinstance(vector, (list, tuple))
+            or len(vector) != dim
+            or not all(
+                isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in vector
+            )
+        ):
+            raise ValueError(f"Expected finite vectors of dimension {dim}")
+
+
+def collection_meta(c, collection, tag):
+    schema = c.describe_collection(collection)
+    # Custom properties survive close/reopen on Lite; description does not.
+    raw = schema.get("properties", {}).get("mvbot.config") or schema.get("description") or "{}"
+    try:
+        meta = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        meta = {}
+    if not isinstance(meta, dict) or meta.get("schema") != tag:
+        raise ValueError(f"Collection '{collection}' has no compatible {tag} configuration; use a new name")
+    return schema, meta
+
+
+def validate_schema(schema, fields, dim=None, dense="dense", primary="pk"):
+    actual = {f["name"]: f for f in schema["fields"]}
+    for name, dtype in fields.items():
+        if name not in actual or int(actual[name]["type"]) != int(dtype):
+            raise ValueError(f"Incompatible collection field: {name}")
+    if schema.get("auto_id") or not actual[primary].get("is_primary"):
+        raise ValueError(f"Expected an explicit {primary} primary key")
+    if dim is not None and int(actual[dense]["params"]["dim"]) != dim:
+        raise ValueError("Collection vector dimension does not match recorded model dimension")
+
+
+def ensure_loaded(c, collection):
+    if "Loaded" not in str(c.get_load_state(collection).get("state")):
+        c.load_collection(collection)
+
+
+def query_rows(c, collection, filter, output_fields):
+    iterator = c.query_iterator(
+        collection, filter=filter, output_fields=output_fields, batch_size=1000, consistency_level="Strong"
+    )
+    try:
+        while batch := iterator.next():
+            yield from batch
+    finally:
+        iterator.close()
+
+
+def resolve_embedding(a, meta):
+    provider = a.embed_provider or meta["embed_provider"]
+    model = a.embed_model or meta["embed_model"]
+    if (provider, model) != (meta["embed_provider"], meta["embed_model"]):
+        raise ValueError(
+            "Embedding provider/model differs from collection configuration; use a new collection"
+        )
+    return Embedder(provider, a.embed_endpoint, model, a.embed_batch, a.embed_timeout)
 
 
 def redact_uri(uri):
@@ -74,10 +185,14 @@ def add_embed_args(ap):
 
 
 # Some embedding models are trained with task prefixes. They are recorded in the
-# collection description so queries always use the same convention as ingest.
+# collection configuration so queries always use the same convention as ingest.
 # min_score = suggested "found" threshold on the best dense cosine (calibrate per model with off-topic questions).
 MODEL_PREFIXES = {
-    "embeddinggemma": {"query": "task: search result | query: ", "doc": "title: {title} | text: ", "min_score": 0.62},
+    "embeddinggemma": {
+        "query": "task: search result | query: ",
+        "doc": "title: {title} | text: ",
+        "min_score": 0.62,
+    },
     "nomic-embed-text": {"query": "search_query: ", "doc": "search_document: ", "min_score": 0.5},
 }
 
@@ -113,7 +228,7 @@ class Embedder:
                     return json.loads(r.read())
             except urllib.error.HTTPError as e:
                 msg = e.read().decode(errors="replace")[:300]
-                if e.code >= 500 and attempt < 2:
+                if (e.code == 429 or e.code >= 500) and attempt < 2:
                     time.sleep(1 + attempt)
                     continue
                 sys.exit(f"ERROR: embedding request failed HTTP {e.code} at {url}: {msg}")
@@ -126,7 +241,7 @@ class Embedder:
     def embed(self, texts):
         out = []
         for i in range(0, len(texts), self.batch):
-            chunk = texts[i:i + self.batch]
+            chunk = texts[i : i + self.batch]
             if self.provider == "ollama":
                 d = self._post(self.endpoint + "/api/embed", {"model": self.model, "input": chunk})
                 vecs = d.get("embeddings")
@@ -134,8 +249,12 @@ class Embedder:
                 d = self._post(self.endpoint + "/embeddings", {"model": self.model, "input": chunk})
                 vecs = [x["embedding"] for x in sorted(d.get("data", []), key=lambda x: x.get("index", 0))]
             if not vecs or len(vecs) != len(chunk):
-                sys.exit(f"ERROR: embedding endpoint returned {len(vecs or [])} vectors for {len(chunk)} inputs")
+                sys.exit(
+                    f"ERROR: embedding endpoint returned {len(vecs or [])} vectors for {len(chunk)} inputs"
+                )
             out.extend(vecs)
+        if out:
+            validate_vectors(out, len(out[0]), len(texts))
         return out
 
     def dim(self):

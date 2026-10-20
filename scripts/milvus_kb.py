@@ -1,33 +1,46 @@
-# /// script
-# requires-python = ">=3.10"
-# dependencies = ["pymilvus>=2.6,<4", "pypdf>=4", "python-docx>=1.1"]
-# ///
-"""Knowledge-base (Knowledge Desk / 知识库管家) toolkit: ingest documents into a Milvus hybrid
-(dense + BM25) collection and answer questions with cited chunks.
+"""Ingest documents and retrieve cited chunks through MilvusClient.
 
-  uv run scripts/milvus_kb.py init      --collection kb_docs --embed-model embeddinggemma-2:740m
-  uv run scripts/milvus_kb.py ingest    docs/ handbook.pdf --collection kb_docs
-  uv run scripts/milvus_kb.py query     "如何创建 HNSW 索引？" --collection kb_docs
-  uv run scripts/milvus_kb.py info      --collection kb_docs
-  uv run scripts/milvus_kb.py list-docs --collection kb_docs
-  uv run scripts/milvus_kb.py delete-doc --source docs/old.md --collection kb_docs          # dry-run
-  uv run scripts/milvus_kb.py delete-doc --source docs/old.md --collection kb_docs --execute --confirm kb_docs
-
-Supported files: .md .markdown .txt .pdf .docx. Re-ingesting is idempotent: a document whose
-content hash is unchanged is skipped; a changed document is upserted (deterministic pks) and its
-stale chunks are deleted. The embedding provider/model/dim/prefixes are recorded in the collection
-description, and query/ingest refuse to mix models.
-Connection / embedding settings: see mvbot_common.py (MILVUS_URI, EMBED_* env vars).
+Run with uv run --project /path/to/plugin /path/to/plugin/scripts/milvus_kb.py.
+Document IDs use resolved paths by default, or an explicit namespace + source root.
+Retries verify the complete chunk set before declaring a document unchanged.
 """
-import argparse, hashlib, json, os, re, sys, time
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mvbot_common import (Embedder, add_embed_args, add_milvus_args, connect,
-                          default_prefixes, env, print_json, redact_uri)
+from mvbot_common import (
+    Embedder,
+    add_embed_args,
+    add_milvus_args,
+    check_write,
+    collection_meta,
+    connect,
+    default_prefixes,
+    ensure_loaded,
+    env,
+    literal,
+    print_json,
+    query_rows,
+    redact_uri,
+    resolve_embedding,
+    validate_schema,
+    validate_vectors,
+)
+from mvbot_search import search
 
 SCHEMA_TAG = "mvbot-kb/v1"
 CHUNKER_VERSION = "1"
-DEFAULT_CHUNK, DEFAULT_OVERLAP = int(os.environ.get("KB_CHUNK_SIZE", "500")), int(os.environ.get("KB_CHUNK_OVERLAP", "80"))
+DEFAULT_CHUNK, DEFAULT_OVERLAP = (
+    int(os.environ.get("KB_CHUNK_SIZE", "500")),
+    int(os.environ.get("KB_CHUNK_OVERLAP", "80")),
+)
 EXTS = {".md", ".markdown", ".txt", ".pdf", ".docx"}
 ANALYZER = {"tokenizer": "jieba", "filter": ["lowercase", "cnalphanumonly"]}  # zh + en
 OUT_FIELDS = ["pk", "doc_id", "source", "title", "heading", "page", "chunk_no", "lang", "text"]
@@ -60,7 +73,7 @@ def parse_markdown(text, fallback_title):
             level, h = len(m.group(1)), m.group(2).strip()
             if level == 1 and title is None:
                 title = h
-            stack[:] = [(l, x) for l, x in stack if l < level] + [(level, h)]
+            stack[:] = [(level_value, x) for level_value, x in stack if level_value < level] + [(level, h)]
         elif not line.strip() and not in_code:
             flush()
         else:
@@ -78,18 +91,20 @@ def parse_txt(text, fallback_title):
 
 def parse_pdf(path, fallback_title):
     from pypdf import PdfReader
+
     r = PdfReader(path)
     title = (r.metadata.title if r.metadata and r.metadata.title else None) or fallback_title
     blocks = []
     for i, page in enumerate(r.pages, 1):
         t = page.extract_text() or ""
-        ps = _paras(t) or [l.strip() for l in t.splitlines() if l.strip()]
+        ps = _paras(t) or [level_value.strip() for level_value in t.splitlines() if level_value.strip()]
         blocks += [("", i, re.sub(r"[ \t]*\n[ \t]*", "\n", p)) for p in ps]
     return title, blocks
 
 
 def parse_docx(path, fallback_title):
     import docx
+
     d = docx.Document(path)
     title = (d.core_properties.title or "").strip() or None
     blocks, stack = [], []
@@ -106,7 +121,7 @@ def parse_docx(path, fallback_title):
             level = int(m.group(2))
             if level == 1 and title is None:
                 title = t
-            stack[:] = [(l, x) for l, x in stack if l < level] + [(level, t)]
+            stack[:] = [(level_value, x) for level_value, x in stack if level_value < level] + [(level, t)]
             continue
         blocks.append((" > ".join(h for _, h in stack), None, t))
     for ti, table in enumerate(d.tables, 1):
@@ -139,11 +154,16 @@ def _split_long(text, size):
     for s in sents:
         while len(s) > size:  # hard split very long sentences
             if cur:
-                out.append(cur); cur = ""
-            out.append(s[:size]); s = s[size:]
+                out.append(cur)
+                cur = ""
+            out.append(s[:size])
+            s = s[size:]
         if len(cur) + len(s) > size and cur:
-            out.append(cur); cur = ""
-        sep = "" if (not cur or cur.endswith((" ", "\n")) or CJK.search(cur[-1:]) or CJK.search(s[:1])) else " "
+            out.append(cur)
+            cur = ""
+        sep = (
+            "" if (not cur or cur.endswith((" ", "\n")) or CJK.search(cur[-1:]) or CJK.search(s[:1])) else " "
+        )
         cur += sep + s
     if cur.strip():
         out.append(cur)
@@ -155,7 +175,7 @@ def _tail(text, overlap):
         return text if overlap > 0 else ""
     t = text[-overlap:]
     m = re.search(r"[。！？!?；;.]\s*", t)  # start the overlap at a sentence boundary when possible
-    return t[m.end():] if m and m.end() < len(t) - 10 else t
+    return t[m.end() :] if m and m.end() < len(t) - 10 else t
 
 
 def chunk_blocks(blocks, size, overlap):
@@ -165,7 +185,8 @@ def chunk_blocks(blocks, size, overlap):
         heading, page = blocks[i][0], blocks[i][1]
         sec = []
         while i < len(blocks) and blocks[i][0] == heading and blocks[i][1] == page:
-            sec.append(blocks[i][2]); i += 1
+            sec.append(blocks[i][2])
+            i += 1
         pieces = []
         for p in sec:
             lim = max(50, size - overlap)  # leave room for the overlap prefix
@@ -196,22 +217,48 @@ def clip_bytes(s, n):
 
 # ------------------------------------------------------------------ collection
 def read_meta(c, col):
-    d = c.describe_collection(col)
-    try:
-        meta = json.loads(d.get("description") or "{}")
-    except json.JSONDecodeError:
-        meta = {}
-    return d, meta if meta.get("schema") == SCHEMA_TAG else None
+    from pymilvus import DataType
+
+    schema, meta = collection_meta(c, col, SCHEMA_TAG)
+    fields = {
+        name: DataType.VARCHAR
+        for name in ["pk", "doc_id", "doc_hash", "source", "title", "heading", "lang", "text"]
+    }
+    fields.update({name: DataType.INT64 for name in ["page", "chunk_no", "updated_at"]})
+    fields.update(dense=DataType.FLOAT_VECTOR, sparse=DataType.SPARSE_FLOAT_VECTOR)
+    validate_schema(schema, fields, meta["dim"])
+    if not any(
+        f.get("input_field_names") == ["text"] and f.get("output_field_names") == ["sparse"]
+        for f in schema.get("functions", [])
+    ):
+        raise ValueError("Expected a text-to-sparse BM25 function")
+    return schema, meta
 
 
 def create_collection(c, col, emb, dim, prefixes, a):
     from pymilvus import DataType, Function, FunctionType
-    meta = {"schema": SCHEMA_TAG, "embed_provider": emb.provider, "embed_model": emb.model, "dim": dim,
-            "metric": "COSINE", "query_prefix": prefixes["query"], "doc_prefix": prefixes["doc"],
-            "min_score": prefixes.get("min_score", 0.5),
-            "chunk_size": a.chunk_size or DEFAULT_CHUNK, "chunk_overlap": a.chunk_overlap if a.chunk_overlap is not None else DEFAULT_OVERLAP, "analyzer": ANALYZER,
-            "created_at": int(time.time())}
-    s = c.create_schema(auto_id=False, enable_dynamic_field=False, description=json.dumps(meta, ensure_ascii=False))
+
+    size = a.chunk_size if a.chunk_size is not None else DEFAULT_CHUNK
+    overlap = a.chunk_overlap if a.chunk_overlap is not None else DEFAULT_OVERLAP
+    if size < 100 or not 0 <= overlap < size:
+        raise ValueError("Require chunk_size >= 100 and 0 <= chunk_overlap < chunk_size")
+    meta = {
+        "schema": SCHEMA_TAG,
+        "embed_provider": emb.provider,
+        "embed_model": emb.model,
+        "dim": dim,
+        "metric": "COSINE",
+        "query_prefix": prefixes["query"],
+        "doc_prefix": prefixes["doc"],
+        "min_score": prefixes.get("min_score", 0.5),
+        "chunk_size": size,
+        "chunk_overlap": overlap,
+        "analyzer": ANALYZER,
+        "created_at": int(time.time()),
+    }
+    s = c.create_schema(
+        auto_id=False, enable_dynamic_field=False, description=json.dumps(meta, ensure_ascii=False)
+    )
     s.add_field("pk", DataType.VARCHAR, is_primary=True, max_length=160)
     s.add_field("doc_id", DataType.VARCHAR, max_length=40)
     s.add_field("doc_hash", DataType.VARCHAR, max_length=64)
@@ -222,19 +269,42 @@ def create_collection(c, col, emb, dim, prefixes, a):
     s.add_field("chunk_no", DataType.INT64)
     s.add_field("lang", DataType.VARCHAR, max_length=8)
     s.add_field("updated_at", DataType.INT64)
-    s.add_field("text", DataType.VARCHAR, max_length=65535, enable_analyzer=True, enable_match=True,
-                analyzer_params=ANALYZER)
+    s.add_field(
+        "text",
+        DataType.VARCHAR,
+        max_length=65535,
+        enable_analyzer=True,
+        enable_match=True,
+        analyzer_params=ANALYZER,
+    )
     s.add_field("dense", DataType.FLOAT_VECTOR, dim=dim)
     s.add_field("sparse", DataType.SPARSE_FLOAT_VECTOR)
-    s.add_function(Function(name="text_bm25", function_type=FunctionType.BM25,
-                            input_field_names=["text"], output_field_names=["sparse"]))
+    s.add_function(
+        Function(
+            name="text_bm25",
+            function_type=FunctionType.BM25,
+            input_field_names=["text"],
+            output_field_names=["sparse"],
+        )
+    )
     ip = c.prepare_index_params()
     ip.add_index("dense", index_type="AUTOINDEX", metric_type="COSINE")
-    ip.add_index("sparse", index_type="SPARSE_INVERTED_INDEX", metric_type="BM25",
-                 params={"inverted_index_algo": "DAAT_MAXSCORE"})
+    ip.add_index(
+        "sparse",
+        index_type="SPARSE_INVERTED_INDEX",
+        metric_type="BM25",
+        params={"inverted_index_algo": "DAAT_MAXSCORE"},
+    )
     ip.add_index("doc_id", index_type="INVERTED")
     ip.add_index("source", index_type="INVERTED")
-    c.create_collection(col, schema=s, index_params=ip)
+    check_write(col)
+    c.create_collection(
+        col,
+        schema=s,
+        index_params=ip,
+        consistency_level="Strong",
+        properties={"mvbot.config": json.dumps(meta, ensure_ascii=False)},
+    )
     return meta
 
 
@@ -246,19 +316,11 @@ def resolve_embedder(c, a, create=False):
     meta = None
     if exists:
         _, meta = read_meta(c, col)
-        if meta is None:
-            sys.exit(f"ERROR: collection '{col}' exists but was not created by this tool (no {SCHEMA_TAG} "
-                     "description). Use another --collection name.")
-        provider = a.embed_provider or meta["embed_provider"]
-        model = a.embed_model or meta["embed_model"]
-        if model == meta["embed_model"] and provider != meta["embed_provider"]:
-            print(f"WARNING: collection was built via provider '{meta['embed_provider']}', now using '{provider}' "
-                  f"with the same model '{model}'. OK only if both serve the same model (e.g. Ollama /api/embed vs /v1).",
-                  file=sys.stderr)
-        elif model != meta["embed_model"]:
-            sys.exit(f"ERROR: collection '{col}' was built with {meta['embed_provider']}:{meta['embed_model']} "
-                     f"(dim {meta['dim']}); refusing to use {provider}:{model}. Re-ingest into a new collection.")
-        emb = Embedder(provider, a.embed_endpoint, model, a.embed_batch, a.embed_timeout)
+        for key in ("query_prefix", "doc_prefix"):
+            override = getattr(a, key, None)
+            if override is not None and override != meta[key]:
+                raise ValueError(f"{key} differs from collection configuration; use a new collection")
+        emb = resolve_embedding(a, meta)
         return emb, meta
     if not create:
         sys.exit(f"ERROR: collection '{col}' does not exist. Run `init` or `ingest` first.")
@@ -272,12 +334,6 @@ def resolve_embedder(c, a, create=False):
     meta = create_collection(c, col, emb, dim, prefixes, a)
     print(f"[created] collection '{col}' dense dim={dim} model={emb.provider}:{emb.model} + BM25 sparse")
     return emb, meta
-
-
-def ensure_loaded(c, col):
-    st = str(c.get_load_state(col).get("state"))
-    if "Loaded" not in st:
-        c.load_collection(col)
 
 
 # ------------------------------------------------------------------ commands
@@ -298,85 +354,111 @@ def iter_files(paths):
             print(f"[skip] not found: {p}")
 
 
-def source_name(path, prefix):
-    ap = os.path.abspath(path)
-    rel = os.path.relpath(ap, os.getcwd())
-    name = ap if rel.startswith("..") else rel
-    name = name.replace(os.sep, "/")
-    return (prefix.rstrip("/") + "/" + name) if prefix else name
-
-
-def esc(s):
-    return s.replace("\\", "\\\\").replace('"', '\\"')
+def source_identity(path, a):
+    resolved = Path(path).resolve()
+    if bool(a.namespace) != bool(a.source_root):
+        raise ValueError("Use --namespace and --source-root together for portable document IDs")
+    if a.source_root:
+        try:
+            name = resolved.relative_to(Path(a.source_root).resolve()).as_posix()
+        except ValueError as exc:
+            raise ValueError(f"File is outside --source-root: {path}") from exc
+        identity = [a.namespace, name]
+    else:
+        name = resolved.as_posix()
+        identity = ["absolute-path", name]
+    source = (a.source_prefix.rstrip("/") + "/" + name) if a.source_prefix else name
+    if len(source.encode()) > 1024:
+        raise ValueError("Source exceeds 1024 UTF-8 bytes; use --namespace and --source-root")
+    return source, hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:40]
 
 
 def cmd_init(c, a):
+    check_write(a.collection)
     if c.has_collection(a.collection):
-        _, meta = read_meta(c, a.collection)
-        print(f"[exists] '{a.collection}' meta={json.dumps(meta, ensure_ascii=False)}")
+        _, meta = resolve_embedder(c, a)
+        print_json({"collection": a.collection, "status": "exists", "config": meta})
         return
     resolve_embedder(c, a, create=True)
 
 
 def cmd_ingest(c, a):
-    if a.dry_run and not c.has_collection(a.collection):
-        emb, meta = None, {"chunk_size": DEFAULT_CHUNK, "chunk_overlap": DEFAULT_OVERLAP, "doc_prefix": ""}
-        print(f"[dry-run] collection '{a.collection}' does not exist yet; it would be created on a real run")
+    check_write(a.collection)
+    exists = c.has_collection(a.collection)
+    if a.dry_run:
+        meta = (
+            read_meta(c, a.collection)[1]
+            if exists
+            else {"chunk_size": DEFAULT_CHUNK, "chunk_overlap": DEFAULT_OVERLAP, "doc_prefix": ""}
+        )
+        emb = None
     else:
         emb, meta = resolve_embedder(c, a, create=True)
-    # explicit CLI values win; otherwise use what the collection was created with
-    size = a.chunk_size or meta["chunk_size"]
+        ensure_loaded(c, a.collection)
+    size = a.chunk_size if a.chunk_size is not None else meta["chunk_size"]
     overlap = a.chunk_overlap if a.chunk_overlap is not None else meta["chunk_overlap"]
-    if overlap >= size or size < 100:
-        sys.exit("ERROR: need chunk_size >= 100 and chunk_overlap < chunk_size")
+    if size < 100 or not 0 <= overlap < size:
+        raise ValueError("Require chunk_size >= 100 and 0 <= chunk_overlap < chunk_size")
     files = list(iter_files(a.paths))
     if not files:
-        sys.exit("ERROR: no supported files found")
-    summary = {"added": 0, "updated": 0, "unchanged": 0, "empty": 0, "chunks_written": 0, "stale_deleted": 0}
+        raise ValueError("No supported files found")
+    summary = {"added": 0, "updated": 0, "unchanged": 0, "chunks_written": 0, "stale_deleted": 0}
     for path in files:
-        src = source_name(path, a.source_prefix)
-        doc_id = hashlib.sha1(src.encode()).hexdigest()[:20]
-        raw = open(path, "rb").read()
-        doc_hash = hashlib.sha256(raw + f"|{size}|{overlap}|{CHUNKER_VERSION}".encode()).hexdigest()
-        old = c.query(a.collection, filter=f'doc_id == "{doc_id}"', output_fields=["doc_hash"], limit=1) if emb else []
-        if old and old[0]["doc_hash"] == doc_hash and not a.force:
-            summary["unchanged"] += 1
-            print(f"[unchanged] {src}")
-            continue
+        src, doc_id = source_identity(path, a)
+        raw = Path(path).read_bytes()
+        doc_hash = hashlib.sha256(raw + f"|{size}|{overlap}|{CHUNKER_VERSION}|{src}".encode()).hexdigest()
         title, blocks = parse_file(path)
         chunks = chunk_blocks(blocks, size, overlap)
         if not chunks:
-            summary["empty"] += 1
-            print(f"[empty] {src} (no extractable text; scanned PDF? OCR it first)")
+            raise ValueError(
+                f"No extractable text in {src}; existing chunks retained. "
+                "Use delete-doc to remove them explicitly, or OCR a scanned PDF first"
+            )
+        flt = f"doc_id == {literal(doc_id)}"
+        old = list(query_rows(c, a.collection, flt, ["pk", "doc_hash"])) if emb else []
+        expected = {f"{doc_id}#{n:05d}" for n in range(len(chunks))}
+        complete = {r["pk"] for r in old} == expected and all(r["doc_hash"] == doc_hash for r in old)
+        if complete and not a.force:
+            summary["unchanged"] += 1
+            print(f"[unchanged] {src}")
             continue
         now = int(time.time())
         rows, inputs = [], []
         for n, (heading, page, body) in enumerate(chunks):
-            text = (f"[{heading}]\n" if heading else "") + body
-            rows.append({"pk": f"{doc_id}#{n:05d}", "doc_id": doc_id, "doc_hash": doc_hash,
-                         "source": clip_bytes(src, 1024), "title": clip_bytes(title, 512),
-                         "heading": clip_bytes(heading, 1024), "page": page or 0, "chunk_no": n,
-                         "lang": lang_of(body), "updated_at": now, "text": clip_bytes(text, 65000)})
+            text = clip_bytes((f"[{heading}]\n" if heading else "") + body, 65000)
+            rows.append(
+                {
+                    "pk": f"{doc_id}#{n:05d}",
+                    "doc_id": doc_id,
+                    "doc_hash": doc_hash,
+                    "source": src,
+                    "title": clip_bytes(title, 512),
+                    "heading": clip_bytes(heading, 1024),
+                    "page": page or 0,
+                    "chunk_no": n,
+                    "lang": lang_of(body),
+                    "updated_at": now,
+                    "text": text,
+                }
+            )
             inputs.append(meta["doc_prefix"].replace("{title}", title or "none") + text)
         if a.dry_run:
             print(f"[dry-run] {src}: title={title!r} chunks={len(rows)} (not written)")
             continue
         vecs = emb.embed(inputs)
-        if len(vecs[0]) != meta["dim"]:
-            sys.exit(f"ERROR: model returned dim {len(vecs[0])} but collection expects {meta['dim']}")
-        for r, v in zip(rows, vecs):
-            r["dense"] = v
+        validate_vectors(vecs, meta["dim"], len(rows))
+        for row, vector in zip(rows, vecs):
+            row["dense"] = vector
         for i in range(0, len(rows), 64):
-            c.upsert(a.collection, rows[i:i + 64])
-        stale = c.query(a.collection, filter=f'doc_id == "{doc_id}" and doc_hash != "{doc_hash}"',
-                        output_fields=["pk"], limit=16384)
+            c.upsert(a.collection, rows[i : i + 64])
+        stale = [r for r in old if r["pk"] not in expected]
         if stale:
-            c.delete(a.collection, filter=f'doc_id == "{doc_id}" and doc_hash != "{doc_hash}"')
+            c.delete(a.collection, filter=flt + f" and chunk_no >= {len(rows)}")
         kind = "updated" if old else "added"
         summary[kind] += 1
         summary["chunks_written"] += len(rows)
         summary["stale_deleted"] += len(stale)
-        print(f"[{kind}] {src}: {len(rows)} chunks" + (f", {len(stale)} stale chunks deleted" if stale else ""))
+        print(f"[{kind}] {src}: {len(rows)} chunks, {len(stale)} stale chunks deleted")
     print("summary:", json.dumps(summary))
 
 
@@ -388,7 +470,8 @@ def _hit(h):
     if pk is None:
         for k in ("id", "pk"):
             try:
-                pk = h[k]; break
+                pk = h[k]
+                break
             except (KeyError, TypeError):
                 pass
     if pk is None:
@@ -400,79 +483,104 @@ def _hit(h):
 
 
 def cmd_query(c, a):
-    from pymilvus import AnnSearchRequest, RRFRanker, WeightedRanker
-    emb, meta = resolve_embedder(c, a)
-    if a.min_score is None:
-        a.min_score = float(meta.get("min_score", 0.5))
-    ensure_loaded(c, a.collection)
-    cand = max(a.candidates, a.top_k)
-    flt = a.filter or ""
-    qvec = emb.embed([meta["query_prefix"] + a.question])[0]
-    dense = c.search(a.collection, data=[qvec], anns_field="dense", limit=cand, filter=flt,
-                     search_params={"metric_type": "COSINE"}, output_fields=OUT_FIELDS)[0]
-    dense_score = {_hit(h)[0]: _hit(h)[1] for h in dense}
-    if a.mode == "dense":
-        hits = list(dense)[:a.top_k]
-    elif a.mode == "bm25":
-        hits = c.search(a.collection, data=[a.question], anns_field="sparse", limit=a.top_k, filter=flt,
-                        search_params={"metric_type": "BM25"}, output_fields=OUT_FIELDS)[0]
-    else:
-        reqs = [AnnSearchRequest(data=[qvec], anns_field="dense", param={"metric_type": "COSINE"}, limit=cand, expr=flt),
-                AnnSearchRequest(data=[a.question], anns_field="sparse", param={"metric_type": "BM25"}, limit=cand, expr=flt)]
-        ranker = RRFRanker(a.rrf_k) if a.ranker == "rrf" else WeightedRanker(*[float(x) for x in a.weights.split(",")])
-        hits = c.hybrid_search(a.collection, reqs, ranker, limit=a.top_k, output_fields=OUT_FIELDS)[0]
+    _, meta = read_meta(c, a.collection)
+    if a.min_score is not None and a.mode != "dense":
+        raise ValueError("--min-score is a cosine threshold for --mode dense only")
+    qvec = None
+    if a.mode != "bm25":
+        emb = resolve_embedding(a, meta)
+        qvec = emb.embed([meta["query_prefix"] + a.question])[0]
+        validate_vectors([qvec], meta["dim"])
+    hits = search(
+        c,
+        a.collection,
+        mode=a.mode,
+        text=a.question,
+        vector=qvec,
+        filter=a.filter,
+        top_k=a.top_k,
+        candidates=max(a.candidates, a.top_k),
+        ranker=a.ranker,
+        rrf_k=a.rrf_k,
+        weights=tuple(float(x) for x in a.weights.split(",")),
+        output_fields=OUT_FIELDS,
+    )
+    threshold = a.min_score if a.min_score is not None else float(meta.get("min_score", 0.5))
     results = []
-    for i, h in enumerate(hits, 1):
-        pk, dist, e = _hit(h)
-        results.append({"cite": i, "pk": pk, "score": round(dist, 4),
-                        "dense_cosine": round(float(dense_score[pk]), 4) if pk in dense_score else None,
-                        "source": e.get("source"), "title": e.get("title"), "heading": e.get("heading"),
-                        "page": e.get("page") or None, "chunk_no": e.get("chunk_no"), "lang": e.get("lang"),
-                        "text": e.get("text")})
-    best = max([r["dense_cosine"] for r in results if r["dense_cosine"] is not None] or [0.0])
-    found = bool(results) and best >= a.min_score
-    out = {"question": a.question, "collection": a.collection, "mode": a.mode + (f"/{a.ranker}" if a.mode == "hybrid" else ""),
-           "embed_model": f"{meta['embed_provider']}:{meta['embed_model']}", "best_dense_cosine": round(best, 4),
-           "min_score": a.min_score, "found": found, "results": results}
+    for h in hits:
+        pk, score, e = _hit(h)
+        if a.mode == "dense" and score < threshold:
+            continue
+        results.append(
+            {
+                "cite": len(results) + 1,
+                "pk": pk,
+                "score": score,
+                "dense_cosine": score if a.mode == "dense" else None,
+                **{key: e.get(key) for key in OUT_FIELDS if key != "pk"},
+            }
+        )
+    out = {
+        "question": a.question,
+        "collection": a.collection,
+        "mode": a.mode,
+        "found": bool(results),
+        "min_score": threshold if a.mode == "dense" else None,
+        "score_kind": {"dense": "cosine", "bm25": "bm25", "hybrid": a.ranker}[a.mode],
+        "results": results,
+    }
+    # found means retrieved candidates; relevance and answerability still require reading the text.
     if a.json:
         print_json(out)
         return
-    print(f"Q: {a.question}\nmode={a.mode} model={out['embed_model']} best_dense_cosine={out['best_dense_cosine']} "
-          f"threshold={a.min_score} -> {'FOUND' if found else 'NOT_FOUND (answer: 知识库中没有找到相关内容)'}")
+    print(f"Q: {a.question}\nmode={a.mode} found={out['found']} score={out['score_kind']}")
     for r in results:
-        loc = r["source"] + (f" > {r['heading']}" if r["heading"] else "") + (f" (p.{r['page']})" if r["page"] else "")
-        print(f"\n[{r['cite']}] {loc}\n    pk={r['pk']} score={r['score']} dense_cosine={r['dense_cosine']}")
-        body = r["text"] if a.full else (r["text"][:300] + ("…" if len(r["text"]) > 300 else ""))
-        print("    " + body.replace("\n", "\n    "))
+        print(f"\n[{r['cite']}] {r['source']} > {r['heading'] or ''} (page {r['page'] or '-'})")
+        print(f"    pk={r['pk']} score={r['score']:.4f}")
+        print(r["text"] if a.full else r["text"][:300])
 
 
 def _docs(c, col, flt=""):
     docs = {}
-    it = c.query_iterator(col, batch_size=1000, filter=flt,
-                          output_fields=["doc_id", "source", "title", "doc_hash", "updated_at"])
-    while True:
-        batch = it.next()
-        if not batch:
-            it.close(); break
-        for r in batch:
-            d = docs.setdefault(r["doc_id"], {"doc_id": r["doc_id"], "source": r["source"], "title": r["title"],
-                                              "doc_hash": r["doc_hash"][:12], "updated_at": r["updated_at"], "chunks": 0})
-            d["chunks"] += 1
+    for r in query_rows(c, col, flt, ["doc_id", "source", "title", "doc_hash", "updated_at"]):
+        d = docs.setdefault(
+            r["doc_id"],
+            {
+                "doc_id": r["doc_id"],
+                "source": r["source"],
+                "title": r["title"],
+                "doc_hash": r["doc_hash"][:12],
+                "updated_at": r["updated_at"],
+                "chunks": 0,
+            },
+        )
+        d["chunks"] += 1
     return sorted(docs.values(), key=lambda d: d["source"])
 
 
 def cmd_info(c, a):
     d, meta = read_meta(c, a.collection)
     ensure_loaded(c, a.collection)
-    rows = c.query(a.collection, filter="", output_fields=["count(*)"])[0]["count(*)"]
+    rows = c.query(a.collection, filter="", output_fields=["count(*)"], consistency_level="Strong")[0][
+        "count(*)"
+    ]
     docs = _docs(c, a.collection)
-    print_json({"collection": a.collection, "uri": redact_uri(a.uri), "kb_meta": meta,
-                "row_count": rows, "documents": len(docs),
-                "load_state": str(c.get_load_state(a.collection).get("state")),
-                "fields": [f["name"] for f in d["fields"]], "functions": [f.get("name") for f in d.get("functions", [])]})
+    print_json(
+        {
+            "collection": a.collection,
+            "uri": redact_uri(a.uri),
+            "kb_meta": meta,
+            "row_count": rows,
+            "documents": len(docs),
+            "load_state": str(c.get_load_state(a.collection).get("state")),
+            "fields": [f["name"] for f in d["fields"]],
+            "functions": [f.get("name") for f in d.get("functions", [])],
+        }
+    )
 
 
 def cmd_list_docs(c, a):
+    read_meta(c, a.collection)
     ensure_loaded(c, a.collection)
     docs = _docs(c, a.collection)
     for d in docs:
@@ -481,14 +589,20 @@ def cmd_list_docs(c, a):
 
 
 def cmd_delete_doc(c, a):
-    if not (a.source or a.doc_id):
-        sys.exit("ERROR: pass --source or --doc-id")
-    flt = f'doc_id == "{esc(a.doc_id)}"' if a.doc_id else f'source == "{esc(a.source)}"'
+    check_write(a.collection)
+    read_meta(c, a.collection)
+    if bool(a.source) == bool(a.doc_id):
+        raise ValueError("Pass exactly one of --source or --doc-id")
+    flt = f"doc_id == {literal(a.doc_id)}" if a.doc_id else f"source == {literal(a.source)}"
     ensure_loaded(c, a.collection)
-    n = len(c.query(a.collection, filter=flt, output_fields=["pk"], limit=16384))
+    n = c.query(a.collection, filter=flt, output_fields=["count(*)"], consistency_level="Strong")[0][
+        "count(*)"
+    ]
     if not a.execute:
-        print(f"[dry-run] would delete {n} chunks from '{a.collection}' where {flt}. "
-              f"Re-run with --execute --confirm {a.collection}")
+        print(
+            f"[dry-run] would delete {n} chunks from '{a.collection}' where {flt}. "
+            f"Re-run with --execute --confirm {a.collection}"
+        )
         return
     if a.confirm != a.collection:
         sys.exit(f"REFUSED: --confirm must equal the collection name '{a.collection}'")
@@ -496,7 +610,7 @@ def cmd_delete_doc(c, a):
     print(f"[deleted] {n} chunks where {flt}")
 
 
-def main():
+def build_parser():
     default_col = env("KB_COLLECTION", "kb_docs")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -510,13 +624,29 @@ def main():
 
     for name in ("init", "ingest"):
         p = common(sub.add_parser(name))
-        p.add_argument("--chunk-size", type=int, default=None, help="characters per chunk (default: collection setting, new collections 500 or env KB_CHUNK_SIZE)")
-        p.add_argument("--chunk-overlap", type=int, default=None, help="default: collection setting, new collections 80 or env KB_CHUNK_OVERLAP")
+        p.add_argument(
+            "--chunk-size",
+            type=int,
+            default=None,
+            help="characters per chunk (default: collection setting, new collections 500 or env KB_CHUNK_SIZE)",
+        )
+        p.add_argument(
+            "--chunk-overlap",
+            type=int,
+            default=None,
+            help="default: collection setting, new collections 80 or env KB_CHUNK_OVERLAP",
+        )
         p.add_argument("--query-prefix", default=None, help="override model task prefix for queries")
-        p.add_argument("--doc-prefix", default=None, help="override model task prefix for documents ({title} allowed)")
+        p.add_argument(
+            "--doc-prefix", default=None, help="override model task prefix for documents ({title} allowed)"
+        )
         if name == "ingest":
             p.add_argument("paths", nargs="+")
             p.add_argument("--source-prefix", default="", help="e.g. a URL base stored in `source`")
+            p.add_argument("--namespace", default="", help="stable project identity, requires --source-root")
+            p.add_argument(
+                "--source-root", default="", help="root for portable source paths, requires --namespace"
+            )
             p.add_argument("--force", action="store_true", help="re-embed even if unchanged")
             p.add_argument("--dry-run", action="store_true", help="parse + chunk only, write nothing")
     p = common(sub.add_parser("query"))
@@ -526,8 +656,12 @@ def main():
     p.add_argument("--candidates", type=int, default=20)
     p.add_argument("--rrf-k", type=int, default=60)
     p.add_argument("--filter", default="", help='Milvus filter, e.g. lang == "zh" or source like "docs/%%"')
-    p.add_argument("--min-score", type=float, default=float(env("KB_MIN_SCORE")) if env("KB_MIN_SCORE") else None,
-                   help="best dense cosine below this => found=false (default: collection min_score, else 0.5)")
+    p.add_argument(
+        "--min-score",
+        type=float,
+        default=None,
+        help="dense mode only: discard hits below this cosine threshold",
+    )
     p.add_argument("--ranker", choices=["rrf", "weighted"], default="rrf")
     p.add_argument("--weights", default="0.7,0.3", help="dense,bm25 weights for --ranker weighted")
     p.add_argument("--json", action="store_true")
@@ -535,15 +669,26 @@ def main():
     common(sub.add_parser("info"), embed=False)
     common(sub.add_parser("list-docs"), embed=False)
     p = common(sub.add_parser("delete-doc"), embed=False)
-    p.add_argument("--source"); p.add_argument("--doc-id")
-    p.add_argument("--execute", action="store_true"); p.add_argument("--confirm", default="")
-    a = ap.parse_args()
+    p.add_argument("--source")
+    p.add_argument("--doc-id")
+    p.add_argument("--execute", action="store_true")
+    p.add_argument("--confirm", default="")
+    return ap
+
+
+def main():
+    a = build_parser().parse_args()
     c = connect(a)
-    if a.cmd not in ("init", "ingest") and not c.has_collection(a.collection):
-        sys.exit(f"ERROR: collection '{a.collection}' does not exist")
-    {"init": cmd_init, "ingest": cmd_ingest, "query": cmd_query, "info": cmd_info,
-     "list-docs": cmd_list_docs, "delete-doc": cmd_delete_doc}[a.cmd](c, a)
+    try:
+        if a.cmd not in ("init", "ingest") and not c.has_collection(a.collection):
+            raise ValueError(f"Collection '{a.collection}' does not exist")
+        globals()["cmd_" + a.cmd.replace("-", "_")](c, a)
+    finally:
+        c.close()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
