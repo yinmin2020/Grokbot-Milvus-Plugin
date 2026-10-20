@@ -40,7 +40,7 @@ def validate(root):
             errors.append(f"Invalid skill metadata: {skill}")
     commands = {}
     sys.path.insert(0, str(root / "scripts"))
-    for name in ("milvus_data", "milvus_kb", "milvus_memory", "milvus_ops"):
+    for name in ("milvus_kb", "milvus_inspect"):
         try:
             module = importlib.import_module(name)
             parser = module.build_parser()

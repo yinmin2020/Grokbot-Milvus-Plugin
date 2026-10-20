@@ -1,8 +1,8 @@
 {
   "name": "milvus",
-  "displayName": "Milvus",
+  "displayName": "Milvus Knowledge Base",
   "version": "0.2.0",
-  "description": "Milvus skills backed by Python scripts using MilvusClient: collection and data operations, dense/BM25/hybrid retrieval, document knowledge bases, explicit user-scoped memory, and guarded maintenance. Supports Milvus Lite, Milvus server and Zilliz Cloud.",
+  "description": "Import and update documents in Milvus, retrieve relevant passages with source citations, and inspect connections and collections through Python scripts using MilvusClient.",
   "author": {
     "name": "yin min"
   },
@@ -17,10 +17,8 @@
     "hybrid-search",
     "bm25",
     "rag",
-    "agent-memory",
     "ollama",
-    "knowledge-base",
-    "ops"
+    "knowledge-base"
   ],
   "logo": "assets/logo.svg"
 }

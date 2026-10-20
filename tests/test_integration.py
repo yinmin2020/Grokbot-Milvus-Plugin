@@ -3,21 +3,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-import milvus_data as data
+import milvus_inspect as inspect
 import milvus_kb as kb
-import milvus_memory as memory
-import milvus_ops as ops
 import pytest
 from mvbot_common import check_write, query_rows, validate_vectors
-from mvbot_search import search
 
 
 def kb_args(collection, *args):
     return kb.build_parser().parse_args([*args, "--collection", collection])
-
-
-def mem_args(collection, *args):
-    return memory.build_parser().parse_args([*args, "--collection", collection])
 
 
 def initialize_kb(client, collection, probe_embedding):
@@ -26,35 +19,6 @@ def initialize_kb(client, collection, probe_embedding):
 
 def rows(client, collection):
     return list(query_rows(client, collection, "", ["pk", "doc_id", "doc_hash", "text"]))
-
-
-def test_metadata_and_native_scores(client, collection):
-    data.create(client, collection, "hybrid", 2)
-    assert data.read_config(client, collection)["dim"] == 2
-    client.upsert(
-        collection,
-        [
-            {"pk": "same", "text": "ZXQERROR42 blue bird", "metadata": {"lang": "en"}, "dense": [1.0, 0.0]},
-            {"pk": "orthogonal", "text": "其他文字", "metadata": {"lang": "zh"}, "dense": [0.0, 1.0]},
-        ],
-    )
-    hits = search(client, collection, mode="dense", vector=[1, 0], top_k=2)
-    assert hits[0]["pk"] == "same"
-    assert hits[0]["distance"] == pytest.approx(1, abs=1e-5)
-    assert hits[1]["distance"] == pytest.approx(0, abs=1e-5)
-    for mode in ("bm25", "hybrid"):
-        hits = search(
-            client,
-            collection,
-            mode=mode,
-            text="ZXQERROR42",
-            vector=[1, 0],
-            filter='metadata["lang"] == "en"',
-            top_k=1,
-        )
-        assert [hit["pk"] for hit in hits] == ["same"]
-    hits = search(client, collection, mode="hybrid", text="ZXQERROR42", vector=[1, 0], ranker="weighted")
-    assert hits[0]["pk"] == "same"
 
 
 def test_document_identity_and_working_directory(client, collection, probe_embedding, tmp_path, monkeypatch):
@@ -150,7 +114,14 @@ def test_bm25_does_not_call_embedding_or_apply_dense_gate(
 
 
 def test_foreign_schema_and_model_rejected(client, collection, probe_embedding):
-    data.create(client, collection, "dense", 2)
+    from pymilvus import DataType
+
+    schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
+    schema.add_field("id", DataType.INT64, is_primary=True)
+    schema.add_field("vector", DataType.FLOAT_VECTOR, dim=2)
+    indexes = client.prepare_index_params()
+    indexes.add_index("vector", index_type="AUTOINDEX", metric_type="COSINE")
+    client.create_collection(collection, schema=schema, index_params=indexes)
     with pytest.raises(ValueError, match="compatible"):
         kb.cmd_init(client, kb_args(collection, "init", "--embed-model", "probe"))
 
@@ -161,107 +132,19 @@ def test_mismatched_model_rejected(client, collection, probe_embedding):
         kb.cmd_init(client, kb_args(collection, "init", "--embed-model", "different"))
 
 
-@pytest.mark.parametrize("mode", ["dense", "bm25", "hybrid"])
-def test_memory_scope_before_topk_and_escaped_user_ids(
-    client, collection, probe_embedding, tmp_path, capsys, mode
-):
-    memory.cmd_init(client, mem_args(collection, "init", "--embed-model", "probe", "--execute"))
-    victim = 'user "one"\\path'
-    users = ["another-user"] * 6 + [victim]
-    path = tmp_path / "memory.txt"
-    path.write_text("ZXQERROR42 is my preference")
-    for i, user in enumerate(users):
-        memory.cmd_remember(
-            client,
-            mem_args(
-                collection,
-                "remember",
-                "--user-id",
-                user,
-                "--memory-id",
-                str(i) if user != victim else "0",
-                "--file",
-                str(path),
-                "--execute",
-            ),
-        )
-    capsys.readouterr()
-    memory.cmd_recall(
-        client,
-        mem_args(collection, "recall", "ZXQERROR42", "--user-id", victim, "--top-k", "1", "--mode", mode),
-    )
-    result = json.loads(capsys.readouterr().out)
-    assert len(result["results"]) == 1
-    assert result["results"][0]["entity"]["user_id"] == victim
-    memory.cmd_forget(
-        client,
-        mem_args(
-            collection,
-            "forget",
-            "--user-id",
-            victim,
-            "--memory-id",
-            "0",
-            "--execute",
-            "--confirm",
-            collection,
-        ),
-    )
-    remaining = list(query_rows(client, collection, "", ["user_id"]))
-    assert len(remaining) == 6
-    assert all(r["user_id"] == "another-user" for r in remaining)
-
-
-def test_memory_native_upsert_preserves_other_user(client, collection, probe_embedding, tmp_path):
-    memory.cmd_init(client, mem_args(collection, "init", "--embed-model", "probe", "--execute"))
-    path = tmp_path / "memory.txt"
-    for user, content in [("a", "old"), ("b", "private"), ("a", "updated")]:
-        path.write_text(content)
-        memory.cmd_remember(
-            client,
-            mem_args(
-                collection,
-                "remember",
-                "--user-id",
-                user,
-                "--memory-id",
-                "same",
-                "--file",
-                str(path),
-                "--execute",
-            ),
-        )
-    found = list(query_rows(client, collection, "", ["user_id", "text"]))
-    assert {r["user_id"]: r["text"] for r in found} == {"a": "updated", "b": "private"}
-
-
-def test_write_guard_shared_by_all_scripts(client, collection, probe_embedding, tmp_path, monkeypatch):
+def test_knowledge_base_write_guards(client, collection, probe_embedding, tmp_path, monkeypatch):
     initialize_kb(client, collection, probe_embedding)
     path = tmp_path / "test.txt"
     path.write_text("test")
-    monkeypatch.setenv("OPS_PROTECTED_COLLECTIONS", collection)
+    monkeypatch.setenv("KB_PROTECTED_COLLECTIONS", collection)
     with pytest.raises(SystemExit, match="protected"):
         kb.cmd_ingest(client, kb_args(collection, "ingest", str(path)))
     with pytest.raises(SystemExit, match="protected"):
         kb.cmd_delete_doc(
             client, kb_args(collection, "delete-doc", "--doc-id", "any", "--execute", "--confirm", collection)
         )
-    with pytest.raises(SystemExit, match="protected"):
-        ops.guard(
-            client,
-            ops.build_parser().parse_args(
-                ["drop-collection", collection, "--execute", "--confirm", collection]
-            ),
-            "drop",
-        )
-    with pytest.raises(SystemExit, match="protected"):
-        data.cmd_create(
-            client, data.build_parser().parse_args(["create", "--collection", collection, "--execute"])
-        )
-    with pytest.raises(SystemExit, match="protected"):
-        memory.cmd_init(client, mem_args(collection, "init", "--execute"))
-    monkeypatch.setenv("OPS_WRITE_ALLOW_PREFIX", "allowed_")
-    with pytest.raises(SystemExit, match="OPS_WRITE_ALLOW_PREFIX"):
+    monkeypatch.setenv("KB_WRITE_ALLOW_PREFIX", "allowed_")
+    with pytest.raises(SystemExit, match="KB_WRITE_ALLOW_PREFIX"):
         check_write("other_collection")
 
 
@@ -269,50 +152,6 @@ def test_validation_rejects_malformed_vectors():
     for vectors in ([[1, 2], [3]], [[1, float("nan")]], [[True, 2]]):
         with pytest.raises(ValueError):
             validate_vectors(vectors, 2)
-
-
-def test_cli_reopens_lite_and_works_outside_repo(tmp_path):
-    root = Path(__file__).resolve().parents[1]
-    uri = str(tmp_path / "cli.db")
-
-    def run(script, *args):
-        return subprocess.run(
-            [sys.executable, str(root / "scripts" / script), *args, "--uri", uri],
-            cwd=tmp_path,
-            text=True,
-            capture_output=True,
-            timeout=120,
-        )
-
-    result = run("milvus_data.py", "create", "--collection", "cli", "--mode", "bm25", "--execute")
-    assert result.returncode == 0, result.stderr
-    path = tmp_path / "rows.json"
-    path.write_text(json.dumps([{"pk": "one", "text": "ZXQERROR42"}]))
-    result = run("milvus_data.py", "upsert", "--collection", "cli", "--file", str(path), "--execute")
-    assert result.returncode == 0, result.stderr
-    result = run("milvus_data.py", "search", "--collection", "cli", "--mode", "bm25", "--text", "ZXQERROR42")
-    assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout)["results"][0]["pk"] == "one"
-    result = run("milvus_ops.py", "drop-collection", "cli", "--execute", "--confirm", "wrong")
-    assert result.returncode != 0
-
-
-@pytest.mark.parametrize("metric,expected", [("COSINE", [1, 0]), ("IP", [1, 0]), ("L2", [0, 2])])
-def test_metric_ordering_on_native_backend(client, collection, metric, expected):
-    from pymilvus import DataType
-
-    schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
-    schema.add_field("pk", DataType.VARCHAR, is_primary=True, max_length=20)
-    schema.add_field("dense", DataType.FLOAT_VECTOR, dim=2)
-    indexes = client.prepare_index_params()
-    indexes.add_index("dense", index_type="AUTOINDEX", metric_type=metric)
-    client.create_collection(collection, schema=schema, index_params=indexes)
-    client.upsert(collection, [{"pk": "same", "dense": [1, 0]}, {"pk": "orthogonal", "dense": [0, 1]}])
-    result = search(
-        client, collection, mode="dense", vector=[1, 0], metric=metric, top_k=2, output_fields=["pk"]
-    )
-    assert [r["pk"] for r in result] == ["same", "orthogonal"]
-    assert [r["distance"] for r in result] == pytest.approx(expected, abs=1e-5)
 
 
 def test_validator_failure_exit_status(tmp_path):
@@ -353,34 +192,130 @@ def test_destructive_confirmation_preserves_data(client, collection, tmp_path, p
         assert len(rows(client, collection)) == 1
 
 
-def test_server_maintenance(client, collection, capsys):
-    import os
+def test_native_retrieval_scores_filters_and_citations(
+    client, collection, probe_embedding, document_files, capsys
+):
+    initialize_kb(client, collection, probe_embedding)
+    kb.cmd_ingest(client, kb_args(collection, "ingest", str(document_files)))
+    capsys.readouterr()
+    for mode in ("dense", "bm25", "hybrid"):
+        kb.cmd_query(
+            client, kb_args(collection, "query", "ZXQERROR42", "--mode", mode, "--json", "--top-k", "1")
+        )
+        result = json.loads(capsys.readouterr().out)
+        hit = result["results"][0]
+        assert hit["source"] == str(document_files / "guide.md")
+        assert hit["heading"] == "Error reference > Disk usage"
+        assert hit["cite"] == 1 and hit["doc_id"] and hit["chunk_no"] == 0
+        assert "full disk" in hit["text"]
+        if mode == "dense":
+            assert hit["score"] == pytest.approx(1, abs=1e-5)
+    for mode in ("dense", "bm25", "hybrid"):
+        # A filter excluding the relevant English document must apply before top-k selection.
+        args = kb_args(
+            collection, "query", "ZXQERROR42", "--mode", mode, "--json", "--filter", 'lang == "zh"'
+        )
+        kb.cmd_query(client, args)
+        result = json.loads(capsys.readouterr().out)
+        assert all(r["lang"] == "zh" for r in result["results"])
+        if mode in ("dense", "bm25"):
+            assert not result["found"]
+    kb.cmd_query(client, kb_args(collection, "query", "CITATIONCHECK42", "--mode", "bm25", "--json"))
+    result = json.loads(capsys.readouterr().out)
+    assert result["results"][0]["source"].endswith("guide_en.pdf")
+    assert result["results"][0]["page"] == 2
+    kb.cmd_query(client, kb_args(collection, "query", "文档标识", "--mode", "bm25", "--json"))
+    result = json.loads(capsys.readouterr().out)
+    assert result["results"][0]["source"].endswith("guide_zh.docx")
+    assert result["results"][0]["heading"] == "文档更新"
 
-    if not os.getenv("TEST_MILVUS_URI", "").startswith(("http://", "https://")):
-        pytest.skip("Server administration is not available on Lite")
-    data.create(client, collection, "dense", 2)
-    client.upsert(collection, [{"pk": "one", "text": "record", "metadata": {}, "dense": [1, 0]}])
 
-    def run(*args):
-        a = ops.build_parser().parse_args(args)
-        globals_fn = getattr(ops, "cmd_" + a.cmd.replace("-", "_"))
-        globals_fn(client, a)
+def test_inspection_does_not_load_or_modify_collections(client, collection, probe_embedding, capsys):
+    initialize_kb(client, collection, probe_embedding)
+    client.release_collection(collection)
+    before = str(client.get_load_state(collection)["state"])
+    args = inspect.build_parser().parse_args(["health"])
+    capsys.readouterr()
+    inspect.cmd_health(client, args)
+    assert json.loads(capsys.readouterr().out)["connected"]
+    inspect.cmd_collections(client, args)
+    assert collection in json.loads(capsys.readouterr().out)["collections"]
+    args = inspect.build_parser().parse_args(["describe", collection])
+    inspect.cmd_describe(client, args)
+    result = json.loads(capsys.readouterr().out)
+    assert result["collection"] == collection
+    assert {f["name"] for f in result["fields"]} >= {"text", "dense", "sparse"}
+    assert str(client.get_load_state(collection)["state"]) == before
 
-    run("describe", collection)
-    run("partitions", collection)
-    run("segments", collection)
-    run("partition-create", collection, "archive", "--execute")
-    assert client.has_partition(collection, "archive")
-    run("flush", collection, "--execute")
-    run("index-create", collection, "--field", "text", "--index-type", "INVERTED", "--execute")
-    run("load", collection, "--execute")
-    run("delete-entities", collection, "--filter", 'pk == "one"')
-    assert len(list(query_rows(client, collection, "", ["pk"]))) == 1
-    run("delete-entities", collection, "--filter", 'pk == "one"', "--execute", "--confirm", collection)
-    assert list(query_rows(client, collection, "", ["pk"])) == []
-    run("release", collection, "--execute", "--confirm", collection)
-    run("index-drop", collection, "--index", "text", "--execute", "--confirm", collection)
-    run("partition-drop", collection, "archive", "--execute", "--confirm", collection)
-    assert not client.has_partition(collection, "archive")
-    run("drop-collection", collection, "--execute", "--confirm", collection)
-    assert not client.has_collection(collection)
+
+def test_cli_reopens_lite_and_works_outside_repo(tmp_path, probe_embedding):
+    root = Path(__file__).resolve().parents[1]
+    uri = str(tmp_path / "cli.db")
+    path = tmp_path / 'quoted "source".txt'
+    path.write_text("ZXQERROR42 means disk full")
+    # Setup also runs in its own process: Lite's embedded server holds its lock until process exit.
+    setup = """
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+sys.path[:0] = [str(root / "scripts"), str(root / "tests")]
+import milvus_kb as kb
+from conftest import ProbeEmbedder
+kb.Embedder = ProbeEmbedder
+args = kb.build_parser().parse_args(["ingest", sys.argv[3], "--collection", "cli", "--uri", sys.argv[2], "--embed-model", "probe"])
+c = kb.connect(args)
+try:
+    kb.cmd_ingest(c, args)
+finally:
+    c.close()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", setup, str(root), uri, str(path)],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+
+    def run(script, *args):
+        return subprocess.run(
+            [sys.executable, str(root / "scripts" / script), *args, "--uri", uri],
+            cwd=tmp_path,
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+
+    result = run("milvus_kb.py", "query", "ZXQERROR42", "--collection", "cli", "--mode", "bm25", "--json")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["results"][0]["source"] == str(path)
+    result = run("milvus_inspect.py", "describe", "cli")
+    assert result.returncode == 0, result.stderr
+    result = run(
+        "milvus_kb.py",
+        "delete-doc",
+        "--collection",
+        "cli",
+        "--source",
+        str(path),
+        "--execute",
+        "--confirm",
+        "wrong",
+    )
+    assert result.returncode != 0
+    result = run(
+        "milvus_kb.py",
+        "delete-doc",
+        "--collection",
+        "cli",
+        "--source",
+        str(path),
+        "--execute",
+        "--confirm",
+        "cli",
+    )
+    assert result.returncode == 0, result.stderr
+    result = run("milvus_kb.py", "info", "--collection", "cli")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["row_count"] == 0

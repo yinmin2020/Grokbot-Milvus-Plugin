@@ -9,18 +9,16 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from kb_documents import chunk_blocks, clip_bytes, lang_of, parse_file
 from mvbot_common import (
     Embedder,
     add_embed_args,
     add_milvus_args,
     check_write,
-    collection_meta,
     connect,
     default_prefixes,
     ensure_loaded,
@@ -30,10 +28,8 @@ from mvbot_common import (
     query_rows,
     redact_uri,
     resolve_embedding,
-    validate_schema,
     validate_vectors,
 )
-from mvbot_search import search
 
 SCHEMA_TAG = "mvbot-kb/v1"
 CHUNKER_VERSION = "1"
@@ -44,189 +40,35 @@ DEFAULT_CHUNK, DEFAULT_OVERLAP = (
 EXTS = {".md", ".markdown", ".txt", ".pdf", ".docx"}
 ANALYZER = {"tokenizer": "jieba", "filter": ["lowercase", "cnalphanumonly"]}  # zh + en
 OUT_FIELDS = ["pk", "doc_id", "source", "title", "heading", "page", "chunk_no", "lang", "text"]
-CJK = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
-
-
-# ------------------------------------------------------------------ parsing
-def _paras(text):
-    return [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-
-
-def parse_markdown(text, fallback_title):
-    blocks, stack, buf, in_code, title = [], [], [], False, None
-
-    def flush():
-        if buf:
-            body = "\n".join(buf).strip()
-            if body:
-                blocks.append((" > ".join(h for _, h in stack), None, body))
-            buf.clear()
-
-    for line in text.splitlines():
-        if line.strip().startswith("```"):
-            in_code = not in_code
-            buf.append(line)
-            continue
-        m = None if in_code else re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", line)
-        if m:
-            flush()
-            level, h = len(m.group(1)), m.group(2).strip()
-            if level == 1 and title is None:
-                title = h
-            stack[:] = [(level_value, x) for level_value, x in stack if level_value < level] + [(level, h)]
-        elif not line.strip() and not in_code:
-            flush()
-        else:
-            buf.append(line)
-    flush()
-    return title or fallback_title, blocks
-
-
-def parse_txt(text, fallback_title):
-    ps = _paras(text)
-    if len(ps) > 1 and "\n" not in ps[0] and len(ps[0]) <= 120:  # short first line = title
-        return ps[0], [("", None, p) for p in ps[1:]]
-    return fallback_title, [("", None, p) for p in ps]
-
-
-def parse_pdf(path, fallback_title):
-    from pypdf import PdfReader
-
-    r = PdfReader(path)
-    title = (r.metadata.title if r.metadata and r.metadata.title else None) or fallback_title
-    blocks = []
-    for i, page in enumerate(r.pages, 1):
-        t = page.extract_text() or ""
-        ps = _paras(t) or [level_value.strip() for level_value in t.splitlines() if level_value.strip()]
-        blocks += [("", i, re.sub(r"[ \t]*\n[ \t]*", "\n", p)) for p in ps]
-    return title, blocks
-
-
-def parse_docx(path, fallback_title):
-    import docx
-
-    d = docx.Document(path)
-    title = (d.core_properties.title or "").strip() or None
-    blocks, stack = [], []
-    for p in d.paragraphs:
-        t = p.text.strip()
-        if not t:
-            continue
-        style = (p.style.name if p.style is not None else "") or ""
-        m = re.match(r"^(Heading|标题)\s*(\d)", style)
-        if style == "Title":
-            title = title or t
-            continue
-        if m:
-            level = int(m.group(2))
-            if level == 1 and title is None:
-                title = t
-            stack[:] = [(level_value, x) for level_value, x in stack if level_value < level] + [(level, t)]
-            continue
-        blocks.append((" > ".join(h for _, h in stack), None, t))
-    for ti, table in enumerate(d.tables, 1):
-        rows = [" | ".join(c.text.strip() for c in row.cells) for row in table.rows]
-        if rows:
-            blocks.append((f"table {ti}", None, "\n".join(rows)))
-    return title or fallback_title, blocks
-
-
-def parse_file(path):
-    ext = os.path.splitext(path)[1].lower()
-    fallback = os.path.splitext(os.path.basename(path))[0]
-    if ext == ".pdf":
-        return parse_pdf(path, fallback)
-    if ext == ".docx":
-        return parse_docx(path, fallback)
-    text = open(path, encoding="utf-8", errors="replace").read()
-    if ext in (".md", ".markdown"):
-        return parse_markdown(text, fallback)
-    return parse_txt(text, fallback)
-
-
-# ------------------------------------------------------------------ chunking
-_SENT = re.compile(r"(?<=[。！？!?；;])|(?<=[.!?])\s+")
-
-
-def _split_long(text, size):
-    sents = [s for s in _SENT.split(text) if s and s.strip()]
-    out, cur = [], ""
-    for s in sents:
-        while len(s) > size:  # hard split very long sentences
-            if cur:
-                out.append(cur)
-                cur = ""
-            out.append(s[:size])
-            s = s[size:]
-        if len(cur) + len(s) > size and cur:
-            out.append(cur)
-            cur = ""
-        sep = (
-            "" if (not cur or cur.endswith((" ", "\n")) or CJK.search(cur[-1:]) or CJK.search(s[:1])) else " "
-        )
-        cur += sep + s
-    if cur.strip():
-        out.append(cur)
-    return out
-
-
-def _tail(text, overlap):
-    if overlap <= 0 or len(text) <= overlap:
-        return text if overlap > 0 else ""
-    t = text[-overlap:]
-    m = re.search(r"[。！？!?；;.]\s*", t)  # start the overlap at a sentence boundary when possible
-    return t[m.end() :] if m and m.end() < len(t) - 10 else t
-
-
-def chunk_blocks(blocks, size, overlap):
-    """blocks: [(heading, page, text)] -> [(heading, page, chunk_text)]; never crosses a section."""
-    chunks, i = [], 0
-    while i < len(blocks):
-        heading, page = blocks[i][0], blocks[i][1]
-        sec = []
-        while i < len(blocks) and blocks[i][0] == heading and blocks[i][1] == page:
-            sec.append(blocks[i][2])
-            i += 1
-        pieces = []
-        for p in sec:
-            lim = max(50, size - overlap)  # leave room for the overlap prefix
-            pieces += _split_long(p, lim) if len(p) > lim else [p]
-        cur = ""
-        for p in pieces:
-            if cur and len(cur) + len(p) + 1 > size:
-                chunks.append((heading, page, cur))
-                tail = _tail(cur, overlap)
-                cur = (tail + "\n" if tail else "") + p
-            else:
-                cur = (cur + "\n" + p) if cur else p
-        if cur.strip():
-            chunks.append((heading, page, cur))
-    return chunks
-
-
-def lang_of(text):
-    if not text:
-        return "und"
-    return "zh" if len(CJK.findall(text)) / max(1, len(text)) > 0.15 else "en"
-
-
-def clip_bytes(s, n):
-    b = s.encode("utf-8")
-    return s if len(b) <= n else b[:n].decode("utf-8", errors="ignore")
 
 
 # ------------------------------------------------------------------ collection
 def read_meta(c, col):
     from pymilvus import DataType
 
-    schema, meta = collection_meta(c, col, SCHEMA_TAG)
+    schema = c.describe_collection(col)
+    # Lite persists custom properties; descriptions are a fallback for existing server collections.
+    raw = schema.get("properties", {}).get("mvbot.config") or schema.get("description") or "{}"
+    try:
+        meta = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        meta = {}
+    if not isinstance(meta, dict) or meta.get("schema") != SCHEMA_TAG:
+        raise ValueError(f"Collection '{col}' has no compatible knowledge-base configuration; use a new name")
     fields = {
         name: DataType.VARCHAR
         for name in ["pk", "doc_id", "doc_hash", "source", "title", "heading", "lang", "text"]
     }
     fields.update({name: DataType.INT64 for name in ["page", "chunk_no", "updated_at"]})
     fields.update(dense=DataType.FLOAT_VECTOR, sparse=DataType.SPARSE_FLOAT_VECTOR)
-    validate_schema(schema, fields, meta["dim"])
+    actual = {f["name"]: f for f in schema["fields"]}
+    for name, dtype in fields.items():
+        if name not in actual or actual[name]["type"] != dtype:
+            raise ValueError(f"Incompatible collection field: {name}")
+    if schema.get("auto_id") or not actual["pk"].get("is_primary"):
+        raise ValueError("Expected an explicit pk primary key")
+    if int(actual["dense"]["params"]["dim"]) != meta["dim"]:
+        raise ValueError("Collection vector dimension does not match recorded model dimension")
     if not any(
         f.get("input_field_names") == ["text"] and f.get("output_field_names") == ["sparse"]
         for f in schema.get("functions", [])
@@ -462,24 +304,52 @@ def cmd_ingest(c, a):
     print("summary:", json.dumps(summary))
 
 
-def _hit(h):
-    """pymilvus 2.x/3.x compatible (pk, distance, entity) for a search hit."""
-    e = h.get("entity") if isinstance(h, dict) and isinstance(h.get("entity"), dict) else None
-    e = e or (h.entity if hasattr(h, "entity") and isinstance(getattr(h, "entity"), dict) else {}) or h
-    pk = getattr(h, "id", None) or getattr(h, "pk", None)
-    if pk is None:
-        for k in ("id", "pk"):
-            try:
-                pk = h[k]
-                break
-            except (KeyError, TypeError):
-                pass
-    if pk is None:
-        pk = e.get("pk")
-    dist = getattr(h, "distance", None)
-    if dist is None:
-        dist = h["distance"]
-    return pk, float(dist), e
+def search_chunks(c, a, vector):
+    """Search the fixed knowledge-base schema with native filtering and fusion."""
+    from pymilvus import AnnSearchRequest, RRFRanker, WeightedRanker
+
+    candidates = max(a.top_k, a.candidates)
+    if not a.question.strip() or not 1 <= a.top_k <= candidates <= 16384:
+        raise ValueError("Require a nonempty question and 1 <= top_k <= candidates <= 16384")
+    ensure_loaded(c, a.collection)
+    common = dict(
+        collection_name=a.collection, limit=a.top_k, output_fields=OUT_FIELDS, consistency_level="Strong"
+    )
+    if a.mode != "hybrid":
+        dense = a.mode == "dense"
+        return c.search(
+            data=[vector if dense else a.question],
+            anns_field="dense" if dense else "sparse",
+            filter=a.filter,
+            search_params={"metric_type": "COSINE" if dense else "BM25"},
+            **common,
+        )[0]
+    requests = [
+        AnnSearchRequest(
+            data=[vector],
+            anns_field="dense",
+            param={"metric_type": "COSINE"},
+            limit=candidates,
+            expr=a.filter,
+        ),
+        AnnSearchRequest(
+            data=[a.question],
+            anns_field="sparse",
+            param={"metric_type": "BM25"},
+            limit=candidates,
+            expr=a.filter,
+        ),
+    ]
+    if a.ranker == "rrf":
+        if a.rrf_k <= 0:
+            raise ValueError("RRF k must be positive")
+        ranker = RRFRanker(a.rrf_k)
+    else:
+        weights = [float(x) for x in a.weights.split(",")]
+        if len(weights) != 2 or any(not 0 <= w <= 1 for w in weights) or not any(weights):
+            raise ValueError("Require two weights in [0, 1] with positive sum")
+        ranker = WeightedRanker(*weights)
+    return c.hybrid_search(reqs=requests, ranker=ranker, **common)[0]
 
 
 def cmd_query(c, a):
@@ -491,24 +361,11 @@ def cmd_query(c, a):
         emb = resolve_embedding(a, meta)
         qvec = emb.embed([meta["query_prefix"] + a.question])[0]
         validate_vectors([qvec], meta["dim"])
-    hits = search(
-        c,
-        a.collection,
-        mode=a.mode,
-        text=a.question,
-        vector=qvec,
-        filter=a.filter,
-        top_k=a.top_k,
-        candidates=max(a.candidates, a.top_k),
-        ranker=a.ranker,
-        rrf_k=a.rrf_k,
-        weights=tuple(float(x) for x in a.weights.split(",")),
-        output_fields=OUT_FIELDS,
-    )
+    hits = search_chunks(c, a, qvec)
     threshold = a.min_score if a.min_score is not None else float(meta.get("min_score", 0.5))
     results = []
     for h in hits:
-        pk, score, e = _hit(h)
+        pk, score, e = h["pk"], float(h["distance"]), h["entity"]
         if a.mode == "dense" and score < threshold:
             continue
         results.append(
@@ -561,16 +418,13 @@ def _docs(c, col, flt=""):
 def cmd_info(c, a):
     d, meta = read_meta(c, a.collection)
     ensure_loaded(c, a.collection)
-    rows = c.query(a.collection, filter="", output_fields=["count(*)"], consistency_level="Strong")[0][
-        "count(*)"
-    ]
     docs = _docs(c, a.collection)
     print_json(
         {
             "collection": a.collection,
             "uri": redact_uri(a.uri),
             "kb_meta": meta,
-            "row_count": rows,
+            "row_count": sum(doc["chunks"] for doc in docs),
             "documents": len(docs),
             "load_state": str(c.get_load_state(a.collection).get("state")),
             "fields": [f["name"] for f in d["fields"]],

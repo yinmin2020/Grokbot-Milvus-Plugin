@@ -7,7 +7,7 @@ Configuration comes from CLI flags first, then environment variables:
   EMBED_MODEL     e.g. embeddinggemma-2:740m / text-embedding-3-small
   EMBED_API_KEY   only for the openai provider (falls back to OPENAI_API_KEY); never printed
   KB_COLLECTION   default knowledge-base collection (default kb_docs)
-  OPS_PROTECTED_COLLECTIONS  comma-separated collections no entry point may change
+  KB_PROTECTED_COLLECTIONS  comma-separated collections no entry point may change
 """
 
 import ipaddress
@@ -73,33 +73,17 @@ def connect(a):
 
 
 def check_write(collection):
-    protected = {x.strip() for x in env("OPS_PROTECTED_COLLECTIONS", "").split(",") if x.strip()}
+    protected = {x.strip() for x in env("KB_PROTECTED_COLLECTIONS", "").split(",") if x.strip()}
     if collection in protected:
         sys.exit(f"REFUSED: '{collection}' is a protected collection")
-    allow = [x.strip() for x in env("OPS_WRITE_ALLOW_PREFIX", "").split(",") if x.strip()]
+    allow = [x.strip() for x in env("KB_WRITE_ALLOW_PREFIX", "").split(",") if x.strip()]
     if allow and not any(collection.startswith(p) for p in allow):
-        sys.exit(f"REFUSED: OPS_WRITE_ALLOW_PREFIX does not allow writes to '{collection}'")
-
-
-def confirm_write(a, destructive=False):
-    check_write(a.collection)
-    if not a.execute:
-        print_json({"dry_run": True, "command": a.cmd, "collection": a.collection})
-        return False
-    if destructive and a.confirm != a.collection:
-        sys.exit(f"REFUSED: --confirm must equal '{a.collection}'")
-    return True
+        sys.exit(f"REFUSED: KB_WRITE_ALLOW_PREFIX does not allow writes to '{collection}'")
 
 
 def literal(value):
     """Encode an untrusted string as one Milvus filter literal."""
     return json.dumps(value, ensure_ascii=False)
-
-
-def checked_text(value, name, max_bytes):
-    if not isinstance(value, str) or not value.strip() or len(value.encode()) > max_bytes:
-        raise ValueError(f"{name} must be nonempty text of at most {max_bytes} UTF-8 bytes")
-    return value
 
 
 def validate_vectors(vectors, dim, count=None):
@@ -114,30 +98,6 @@ def validate_vectors(vectors, dim, count=None):
             )
         ):
             raise ValueError(f"Expected finite vectors of dimension {dim}")
-
-
-def collection_meta(c, collection, tag):
-    schema = c.describe_collection(collection)
-    # Custom properties survive close/reopen on Lite; description does not.
-    raw = schema.get("properties", {}).get("mvbot.config") or schema.get("description") or "{}"
-    try:
-        meta = json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        meta = {}
-    if not isinstance(meta, dict) or meta.get("schema") != tag:
-        raise ValueError(f"Collection '{collection}' has no compatible {tag} configuration; use a new name")
-    return schema, meta
-
-
-def validate_schema(schema, fields, dim=None, dense="dense", primary="pk"):
-    actual = {f["name"]: f for f in schema["fields"]}
-    for name, dtype in fields.items():
-        if name not in actual or int(actual[name]["type"]) != int(dtype):
-            raise ValueError(f"Incompatible collection field: {name}")
-    if schema.get("auto_id") or not actual[primary].get("is_primary"):
-        raise ValueError(f"Expected an explicit {primary} primary key")
-    if dim is not None and int(actual[dense]["params"]["dim"]) != dim:
-        raise ValueError("Collection vector dimension does not match recorded model dimension")
 
 
 def ensure_loaded(c, collection):
